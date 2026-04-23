@@ -21,8 +21,7 @@ from medh5 import MEDH5File
 
 from napari_medh5._bbox import shapes_to_arrays
 from napari_medh5._handles import REGISTRY
-
-LayerTuple = tuple[Any, dict[str, Any], str]
+from napari_medh5._types import LayerDataTuple
 
 
 @dataclass
@@ -36,7 +35,7 @@ class _Bundle:
     source_path: str | None
 
 
-def write_sample(path: str, layer_data: list[LayerTuple]) -> list[str]:
+def write_sample(path: str, layer_data: list[LayerDataTuple]) -> list[str]:
     """Entry point for napari's multi-layer writer contribution."""
     dest = Path(path)
     if dest.suffix != ".medh5":
@@ -54,7 +53,7 @@ def write_sample(path: str, layer_data: list[LayerTuple]) -> list[str]:
     return [str(dest)]
 
 
-def _collect(layer_data: list[LayerTuple]) -> _Bundle:
+def _collect(layer_data: list[LayerDataTuple]) -> _Bundle:
     images: dict[str, np.ndarray] = {}
     seg: dict[str, np.ndarray] = {}
     rect_payload: tuple[Any, dict[str, Any]] | None = None
