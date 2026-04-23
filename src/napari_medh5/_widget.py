@@ -27,6 +27,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from napari_medh5._handles import attach_viewer
+
 _STATUSES = ("pending", "reviewed", "flagged", "rejected")
 
 
@@ -52,6 +54,7 @@ class MEDH5Widget(QWidget):
         root.addStretch(1)
 
         if napari_viewer is not None:
+            attach_viewer(napari_viewer)
             napari_viewer.layers.events.inserted.connect(self._refresh_samples)
             napari_viewer.layers.events.removed.connect(self._refresh_samples)
             self._refresh_samples()

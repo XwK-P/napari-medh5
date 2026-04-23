@@ -78,6 +78,60 @@ def test_handle_refcount_closes_file(tiny_medh5: Path) -> None:
     assert REGISTRY.get(str(tiny_medh5)) is None
 
 
+def test_attach_viewer_drops_handle_on_last_layer_removal(tiny_medh5: Path) -> None:
+    from napari_medh5._handles import attach_viewer
+
+    class _Event:
+        def __init__(self) -> None:
+            self._callbacks: list = []
+
+        def connect(self, cb) -> None:  # type: ignore[no-untyped-def]
+            self._callbacks.append(cb)
+
+        def emit(self, value) -> None:  # type: ignore[no-untyped-def]
+            class _Ev:
+                pass
+
+            ev = _Ev()
+            ev.value = value  # type: ignore[attr-defined]
+            for cb in self._callbacks:
+                cb(ev)
+
+    class _Events:
+        def __init__(self) -> None:
+            self.removed = _Event()
+
+    class _Layer:
+        def __init__(self, path: str) -> None:
+            self.metadata = {"medh5_path": path}
+
+    class _Layers(list):  # type: ignore[type-arg]
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = _Events()
+
+    class _Viewer:
+        def __init__(self) -> None:
+            self.layers = _Layers()
+
+    viewer = _Viewer()
+    attach_viewer(viewer)
+
+    path = str(tiny_medh5)
+    REGISTRY.acquire(path)
+    layer_a = _Layer(path)
+    layer_b = _Layer(path)
+    viewer.layers.extend([layer_a, layer_b])
+
+    viewer.layers.remove(layer_a)
+    viewer.layers.events.removed.emit(layer_a)
+    assert REGISTRY.get(path) is not None, "handle should survive while a layer remains"
+
+    viewer.layers.remove(layer_b)
+    viewer.layers.events.removed.emit(layer_b)
+    assert REGISTRY.get(path) is None, "handle should drop after last layer is removed"
+
+
 def test_shapes_layer_has_features(tiny_medh5: Path) -> None:
     reader = napari_get_reader(str(tiny_medh5))
     assert reader is not None
