@@ -3,6 +3,10 @@
 Lazy napari layers need the underlying ``h5py.File`` to stay open for the
 lifetime of the layer.  We keep one :class:`medh5.MEDH5File` per path and
 reference-count against the number of napari layers that still depend on it.
+
+:func:`attach_viewer` wires a viewer's ``layers.events.removed`` signal so
+the registry drops a file's handle once the last napari layer backed by
+that file is removed.
 """
 
 from __future__ import annotations
@@ -10,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+from typing import Any
+from weakref import WeakSet
 
 from medh5 import MEDH5File
 
@@ -77,3 +83,41 @@ class _Registry:
 
 
 REGISTRY = _Registry()
+
+_attached_viewers: WeakSet[Any] = WeakSet()
+
+
+def _layer_medh5_path(layer: Any) -> str | None:
+    meta = getattr(layer, "metadata", None)
+    if not isinstance(meta, dict):
+        return None
+    path = meta.get("medh5_path")
+    return path if isinstance(path, str) else None
+
+
+def attach_viewer(viewer: Any) -> None:
+    """Hook *viewer* so removing the last layer of a file drops its handle.
+
+    Idempotent per viewer — safe to call on every reader invocation and
+    from the widget constructor.  The viewer is tracked via a ``WeakSet``
+    so garbage-collected viewers don't leak ids across sessions.
+    """
+    if viewer is None or viewer in _attached_viewers:
+        return
+    layers = getattr(viewer, "layers", None)
+    events = getattr(layers, "events", None)
+    removed = getattr(events, "removed", None)
+    if removed is None:
+        return
+    _attached_viewers.add(viewer)
+
+    def _on_removed(event: Any) -> None:
+        removed_layer = getattr(event, "value", None)
+        path = _layer_medh5_path(removed_layer)
+        if path is None:
+            return
+        if any(_layer_medh5_path(layer) == path for layer in layers):
+            return
+        REGISTRY.drop(path)
+
+    removed.connect(_on_removed)
