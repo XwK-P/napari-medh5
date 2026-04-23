@@ -1,0 +1,28 @@
+name: napari-medh5
+display_name: medh5
+contributions:
+  commands:
+    - id: napari-medh5.get_reader
+      python_name: napari_medh5._reader:napari_get_reader
+      title: Open a .medh5 file
+    - id: napari-medh5.write_sample
+      python_name: napari_medh5._writer:write_sample
+      title: Save a .medh5 sample
+    - id: napari-medh5.make_widget
+      python_name: napari_medh5._widget:MEDH5Widget
+      title: Metadata & Review dock
+  readers:
+    - command: napari-medh5.get_reader
+      filename_patterns: ["*.medh5"]
+      accepts_directories: false
+  writers:
+    - command: napari-medh5.write_sample
+      display_name: medh5 sample
+      filename_extensions: [".medh5"]
+      layer_types:
+        - image{1,}
+        - labels*
+        - shapes*
+  widgets:
+    - command: napari-medh5.make_widget
+      display_name: Metadata & Review

@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-medh5"
+version = "0.1.0"
+description = "napari plugin for viewing, annotating, and reviewing .medh5 medical-imaging samples."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Puyang Wang", email = "pauliwang411@gmail.com" },
+]
+keywords = [
+  "napari",
+  "medical imaging",
+  "hdf5",
+  "segmentation",
+  "annotation",
+  "review",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: napari",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Visualization",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+  "Typing :: Typed",
+]
+dependencies = [
+  "medh5>=0.5",
+  "napari>=0.5",
+  "dask>=2024.1",
+  "h5py>=3.10",
+  "numpy>=1.24",
+  "qtpy>=2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "pytest-qt>=4.4",
+  "ruff>=0.4",
+  "mypy>=1.0",
+  "napari[pyqt5]>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/XwK-P/medh5"
+Repository = "https://github.com/XwK-P/medh5"
+Issues = "https://github.com/XwK-P/medh5/issues"
+
+[project.entry-points."napari.manifest"]
+napari-medh5 = "napari_medh5:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["napari_medh5*"]
+
+[tool.setuptools.package-data]
+napari_medh5 = ["napari.yaml", "py.typed"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=napari_medh5 --cov-report=term-missing --cov-fail-under=90"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+disable_error_code = ["misc"]
+
+[[tool.mypy.overrides]]
+module = [
+  "h5py",
+  "h5py.*",
+  "napari",
+  "napari.*",
+  "qtpy",
+  "qtpy.*",
+  "dask",
+  "dask.*",
+  "medh5",
+  "medh5.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
