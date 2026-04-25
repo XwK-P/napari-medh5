@@ -20,7 +20,7 @@ import numpy as np
 from medh5 import MEDH5File
 
 from napari_medh5._bbox import shapes_to_arrays
-from napari_medh5._handles import REGISTRY
+from napari_medh5._handles import REGISTRY, rebind_viewer_layers
 from napari_medh5._types import LayerDataTuple
 
 
@@ -185,12 +185,22 @@ def _save_inplace(dest: Path, bundle: _Bundle) -> None:
         bbox_ops["bbox_labels"] = bundle.bbox_labels
 
     if not seg_ops and not bbox_ops:
+        # Still re-acquire so any lazy layer arrays keep working, since we
+        # closed the handle above. Without this, scrolling after a no-op save
+        # would read from a dead ``h5py.File``.
+        rebind_viewer_layers(dest)
         return
 
+    # ``on_reopened`` is medh5's blessed post-write hook (added in 0.6.0):
+    # invoked with *dest* after the write handle closes successfully. It
+    # pairs with our pre-write ``REGISTRY.drop`` to re-attach lazy dask
+    # views to the freshly reopened datasets, so existing image/seg
+    # layers stay usable after the in-place mutation.
     MEDH5File.update(
         dest,
         seg_ops=seg_ops or None,
         bbox_ops=bbox_ops or None,
+        on_reopened=rebind_viewer_layers,
     )
 
 

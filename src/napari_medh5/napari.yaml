@@ -20,7 +20,7 @@ contributions:
       display_name: medh5 sample
       filename_extensions: [".medh5"]
       layer_types:
-        - image{1,}
+        - image+
         - labels*
         - shapes*
   widgets:

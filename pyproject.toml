@@ -35,7 +35,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "medh5>=0.5",
+  "medh5>=0.6.0",
   "napari>=0.5",
   "dask>=2024.1",
   "h5py>=3.10",
@@ -69,7 +69,15 @@ include = ["napari_medh5*"]
 napari_medh5 = ["napari.yaml", "py.typed"]
 
 [tool.pytest.ini_options]
-addopts = "--cov=napari_medh5 --cov-report=term-missing --cov-fail-under=90"
+addopts = "--cov --cov-report=term-missing --cov-fail-under=90"
+markers = [
+  "integration: real napari.Viewer end-to-end tests",
+]
+
+[tool.coverage.run]
+# Setuptools PEP 660 editable installs confuse coverage's package-name lookup
+# (it returns no data), so we point at the on-disk source tree directly.
+source = ["src/napari_medh5"]
 
 [tool.ruff]
 target-version = "py310"
