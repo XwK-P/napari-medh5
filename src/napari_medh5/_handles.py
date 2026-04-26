@@ -7,6 +7,12 @@ reference-count against the number of napari layers that still depend on it.
 :func:`attach_viewer` wires a viewer's ``layers.events.removed`` signal so
 the registry drops a file's handle once the last napari layer backed by
 that file is removed.
+
+:func:`rebind_viewer_layers` re-attaches lazy ``Image`` / ``Labels`` layers
+to a freshly reopened file after an in-place mutation — HDF5 forbids
+opening the same file twice, so callers must ``REGISTRY.drop(path)`` before
+writing, which invalidates the dask arrays pointing at the now-closed
+datasets.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from threading import Lock
 from typing import Any
 from weakref import WeakSet
 
+import dask.array as da
 from medh5 import MEDH5File
 
 
@@ -95,6 +102,21 @@ def _layer_medh5_path(layer: Any) -> str | None:
     return path if isinstance(path, str) else None
 
 
+def _resolved_layer_medh5_path(layer: Any) -> str | None:
+    """Return the layer's ``medh5_path`` resolved to an absolute, canonical
+    string — matching how :class:`_Registry` keys its entries.
+
+    The reader stores ``medh5_path`` from the original open argument, which
+    can be relative or contain symlinks. Comparing those raw strings against
+    a resolved registry key would miss cross-viewer or relative-vs-absolute
+    matches, leaving lazy layers stranded after :func:`REGISTRY.drop`.
+    """
+    raw = _layer_medh5_path(layer)
+    if raw is None:
+        return None
+    return str(Path(raw).resolve())
+
+
 def attach_viewer(viewer: Any) -> None:
     """Hook *viewer* so removing the last layer of a file drops its handle.
 
@@ -113,11 +135,81 @@ def attach_viewer(viewer: Any) -> None:
 
     def _on_removed(event: Any) -> None:
         removed_layer = getattr(event, "value", None)
-        path = _layer_medh5_path(removed_layer)
-        if path is None:
+        key = _resolved_layer_medh5_path(removed_layer)
+        if key is None:
             return
-        if any(_layer_medh5_path(layer) == path for layer in layers):
+        if any(_resolved_layer_medh5_path(layer) == key for layer in layers):
             return
-        REGISTRY.drop(path)
+        REGISTRY.drop(key)
 
     removed.connect(_on_removed)
+
+
+def rebind_viewer_layers(path: str | Path, viewer: Any | None = None) -> None:
+    """Rebind lazy layer arrays after an in-place mutation of ``path``.
+
+    An in-place write requires :func:`REGISTRY.drop` first — the closed
+    ``h5py.File`` invalidates every lazy ``dask.array`` that napari layers
+    hold, so any subsequent slice read would raise.  This helper:
+
+    1. Re-acquires a fresh handle via :func:`REGISTRY.acquire`.
+    2. Walks every attached viewer's layers and swaps ``.data`` on every
+       ``Image`` / ``Labels`` layer tagged with ``medh5_path == path``
+       (compared after resolving both sides) to a new dask view of the
+       matching dataset in the reopened file.
+
+    The registry is process-global, so a single :func:`REGISTRY.drop` can
+    invalidate layers across *multiple* napari viewers in the same process
+    (e.g. multi-window sessions). This function therefore rebinds across
+    every viewer in :data:`_attached_viewers`, not just the one passed.
+    The optional *viewer* argument is treated as an extra hint (included
+    if not yet tracked) so widget callers don't depend on attach-order.
+
+    ``Shapes`` layers (bbox rect / wire) are pure numpy and need no rebind.
+    If no viewers are tracked the function falls back to
+    ``napari.current_viewer()``; if that is also ``None`` it silently
+    no-ops — callers invoke it best-effort (e.g. the writer may run
+    without any viewer in unit tests).
+    """
+    candidates: list[Any] = list(_attached_viewers)
+    if viewer is not None and viewer not in candidates:
+        candidates.append(viewer)
+    if not candidates:
+        try:
+            import napari
+        except ImportError:
+            return
+        cv = napari.current_viewer()
+        if cv is None:
+            return
+        candidates.append(cv)
+
+    key = str(Path(path).resolve())
+    targets: list[Any] = []
+    for v in candidates:
+        layers = getattr(v, "layers", None)
+        if layers is None:
+            continue
+        for layer in layers:
+            if _resolved_layer_medh5_path(layer) == key and (layer.metadata or {}).get(
+                "medh5_role"
+            ) in {"image", "seg"}:
+                targets.append(layer)
+    if not targets:
+        return
+
+    handle = REGISTRY.acquire(key)
+    for layer in targets:
+        meta = layer.metadata
+        name = meta.get("medh5_name")
+        role = meta.get("medh5_role")
+        group = handle.images if role == "image" else handle.seg
+        if group is None or name not in group:
+            continue
+        ds = group[name]
+        arr = da.from_array(ds, chunks=ds.chunks or "auto")
+        if role == "seg":
+            import numpy as np
+
+            arr = arr.astype(np.uint8)
+        layer.data = arr

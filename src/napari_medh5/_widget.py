@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from medh5 import MEDH5File
+from medh5 import MEDH5File, VerifyResult
 from medh5.review import ReviewStatus, get_review_status, set_review_status
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
@@ -27,7 +27,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from napari_medh5._handles import attach_viewer
+from napari_medh5._handles import REGISTRY, attach_viewer, rebind_viewer_layers
 
 _STATUSES = ("pending", "reviewed", "flagged", "rejected")
 
@@ -101,7 +101,9 @@ class MEDH5Widget(QWidget):
         box = QGroupBox("Validation", self)
         layout = QVBoxLayout(box)
         self._validation_tree = QTreeWidget(box)
-        self._validation_tree.setHeaderLabels(["Severity", "Code", "Message"])
+        self._validation_tree.setHeaderLabels(
+            ["Severity", "Code", "Location", "Message"]
+        )
         self._validation_tree.setRootIsDecorated(False)
         layout.addWidget(self._validation_tree)
         btn_row = QHBoxLayout()
@@ -119,18 +121,22 @@ class MEDH5Widget(QWidget):
         try:
             report = MEDH5File.validate(self._active_path)
         except Exception as exc:  # noqa: BLE001 — surface anything to the user
-            item = QTreeWidgetItem(["error", "validate_failed", str(exc)])
+            item = QTreeWidgetItem(["error", "validate_failed", "", str(exc)])
             self._validation_tree.addTopLevelItem(item)
             return
         for issue in report.errors:
-            item = QTreeWidgetItem(["error", issue.code, issue.message])
+            item = QTreeWidgetItem(
+                ["error", issue.code, issue.location or "", issue.message]
+            )
             self._validation_tree.addTopLevelItem(item)
         for issue in report.warnings:
-            item = QTreeWidgetItem(["warning", issue.code, issue.message])
+            item = QTreeWidgetItem(
+                ["warning", issue.code, issue.location or "", issue.message]
+            )
             self._validation_tree.addTopLevelItem(item)
         if not report.errors and not report.warnings:
             self._validation_tree.addTopLevelItem(
-                QTreeWidgetItem(["ok", "", "No issues reported"])
+                QTreeWidgetItem(["ok", "", "", "No issues reported"])
             )
 
     # ------------------------------------------------------------------
@@ -154,12 +160,21 @@ class MEDH5Widget(QWidget):
         if not self._active_path:
             return
         try:
-            ok = MEDH5File.verify(self._active_path)
+            result = MEDH5File.verify(self._active_path)
         except Exception as exc:  # noqa: BLE001
             self._checksum_label.setText(f"Error: {exc}")
             return
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self._checksum_label.setText(f"{'OK' if ok else 'MISMATCH'} @ {stamp}")
+        # medh5 0.6.0 returns a tri-state ``VerifyResult`` so audit UIs
+        # can distinguish "no checksum was ever stored" from "verified
+        # good" — both used to render as a bare green tick.
+        if result is VerifyResult.OK:
+            text = f"OK @ {stamp}"
+        elif result is VerifyResult.MISSING:
+            text = f"No checksum stored @ {stamp}"
+        else:
+            text = f"MISMATCH @ {stamp}"
+        self._checksum_label.setText(text)
 
     # ------------------------------------------------------------------
     # Review
@@ -242,17 +257,31 @@ class MEDH5Widget(QWidget):
         if checked is None:
             return
         status = checked.text()
+        # ``set_review_status`` opens the file in append mode; HDF5 forbids a
+        # second open while the registry still holds the read handle, so we
+        # drop first. We rely on medh5 0.6.0's ``on_reopened`` callback to
+        # rebind lazy layers on success, and an explicit ``finally`` rebind
+        # to recover from validation/IO errors that abort before the write.
+        REGISTRY.drop(self._active_path)
+        new_status: ReviewStatus | None = None
         try:
-            set_review_status(
+            new_status = set_review_status(
                 self._active_path,
                 status=status,
                 annotator=self._annotator_edit.text() or None,
                 notes=self._notes_edit.toPlainText() or None,
+                on_reopened=lambda p: rebind_viewer_layers(p, self._viewer),
             )
         except Exception as exc:  # noqa: BLE001
             self._annotator_edit.setPlaceholderText(f"Error: {exc}")
+            rebind_viewer_layers(self._active_path, self._viewer)
             return
-        self._refresh_review()
+        # 0.6.0 returns the freshly persisted ReviewStatus, so we can refresh
+        # the UI without reopening the file.
+        self._history_tree.clear()
+        for btn in self._status_buttons.values():
+            btn.setChecked(False)
+        self._populate_review(new_status)
 
     # ------------------------------------------------------------------
     # Metadata tree

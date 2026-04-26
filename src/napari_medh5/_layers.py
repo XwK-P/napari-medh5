@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import dask.array as da
 import numpy as np
@@ -18,23 +18,22 @@ def _spatial_to_affine(spatial: SpatialMeta, ndim: int) -> np.ndarray | None:
     """Return a ``(ndim+1, ndim+1)`` homogeneous affine, or ``None`` if the
     spatial metadata collapses to pure ``scale`` + ``translate`` (in which
     case the caller should pass those directly instead).
+
+    Thin compatibility wrapper around :meth:`medh5.SpatialMeta.as_affine`,
+    which centralises the rotation × spacing + origin composition that
+    every viewer-style consumer used to re-implement. Defensive against a
+    direction matrix whose shape disagrees with *ndim* — upstream raises
+    in that case but we used to silently return ``None``.
     """
     direction = spatial.direction
-    if direction is None:
-        return None
-    rot = np.asarray(direction, dtype=np.float64)
-    if rot.shape != (ndim, ndim):
-        return None
-    if np.allclose(rot, np.eye(ndim)):
-        return None
-
-    spacing = np.asarray(spatial.spacing or [1.0] * ndim, dtype=np.float64)
-    origin = np.asarray(spatial.origin or [0.0] * ndim, dtype=np.float64)
-
-    affine = np.eye(ndim + 1, dtype=np.float64)
-    affine[:ndim, :ndim] = rot * spacing[np.newaxis, :]
-    affine[:ndim, ndim] = origin
-    return affine
+    if direction is not None:
+        rot = np.asarray(direction, dtype=np.float64)
+        if rot.shape != (ndim, ndim):
+            return None
+    # ``medh5`` is in mypy's ignore-imports list, so ``as_affine`` is typed
+    # as ``Any``; cast back to the declared return type so callers stay
+    # well-typed.
+    return cast("np.ndarray[Any, Any] | None", spatial.as_affine(ndim))
 
 
 def _spatial_kwargs(spatial: SpatialMeta, ndim: int) -> dict[str, Any]:

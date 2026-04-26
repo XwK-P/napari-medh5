@@ -14,9 +14,11 @@ The round-trip strategy:
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
+from medh5 import validate_bboxes
 
 from ._types import LayerDataTuple
 
@@ -202,19 +204,30 @@ def shapes_to_arrays(
                     box[axi, 0] = float(lo)
                     box[axi, 1] = float(hi)
 
-        if sample_shape is not None:
-            for a in range(ndim):
-                upper = float(sample_shape[a])
-                box[a, 0] = max(0.0, min(box[a, 0], upper))
-                box[a, 1] = max(0.0, min(box[a, 1], upper))
-
         boxes.append(box)
         used_indices.append(idx)
 
     if not boxes:
         return None, None, None
 
-    bboxes = np.stack(boxes, axis=0)
+    # medh5 stores bboxes as integer voxel indices and ships a clamping
+    # helper (``validate_bboxes``) that bounds-checks every (lo, hi) pair
+    # against the sample shape and emits one issue per adjustment. Round
+    # napari's float coords before calling — the helper raises on float
+    # input.
+    bboxes = np.rint(np.stack(boxes, axis=0)).astype(np.int64)
+    if sample_shape is not None:
+        clamped, issues = validate_bboxes(bboxes, tuple(int(s) for s in sample_shape))
+        if issues:
+            details = "; ".join(
+                f"box {i}/axis {a}: {reason}" for (i, a, reason) in issues
+            )
+            warnings.warn(
+                f"Bbox edits clamped to sample bounds {list(sample_shape)}: {details}",
+                UserWarning,
+                stacklevel=2,
+            )
+        bboxes = clamped
     scores = _collect_feature(features, "score", used_indices, dtype=float)
     labels_raw = _collect_feature(features, "label", used_indices, dtype=object)
     labels: list[str] | None = (
