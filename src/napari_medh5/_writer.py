@@ -1,38 +1,46 @@
 """napari writer for ``.medh5`` files.
 
-Operates in two modes:
+Two modes, chosen by whether the destination is the file the layers came
+from:
 
-- **In-place update** (fast): when the set of image modalities in the layer
-  list matches the source file, only seg, bbox, and metadata changes are
-  pushed via :func:`medh5.MEDH5File.update`.  Preserves compression.
-- **Save As** (full rewrite): when the destination file is different from the
-  source, or the image set diverges, a full :func:`medh5.MEDH5File.write`
-  call is made.  Dask image arrays are materialised as numpy here.
+* **Amend** --- same path, same images.  ``medh5.amend`` is copy-on-write: it
+  rebuilds the file from the old one and replaces it atomically, so unknown
+  objects (including ones written by a future minor version) are copied
+  through untouched.  Only the annotations that changed are re-encoded.
+* **Full write** --- Save As, or a different set of images.  ``medh5.create``
+  from scratch, carrying the source's identity, timepoints, label set and
+  geometry across where there is a source to carry them from.
+
+Both record a provenance activity naming napari as the agent, because an
+annotation edited in a viewer and one produced by a model should not be
+indistinguishable a year later.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+import medh5
 import numpy as np
-from medh5 import MEDH5File
+import numpy.typing as npt
 
-from napari_medh5._bbox import shapes_to_arrays
+from napari_medh5._bbox import shapes_to_boxes
 from napari_medh5._handles import REGISTRY, rebind_viewer_layers
 from napari_medh5._types import LayerDataTuple
+
+AGENT = "napari-medh5"
 
 
 @dataclass
 class _Bundle:
-    images: dict[str, np.ndarray]
-    seg: dict[str, np.ndarray]
-    bboxes: np.ndarray | None
-    bbox_scores: np.ndarray | None
-    bbox_labels: list[str] | None
-    sample_shape: list[int] | None
-    source_path: str | None
+    images: dict[str, npt.NDArray[Any]] = field(default_factory=dict)
+    labelmaps: dict[str, npt.NDArray[Any]] = field(default_factory=dict)
+    seg_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    boxes: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+    source_path: str | None = None
+    image_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def write_sample(path: str, layer_data: list[LayerDataTuple]) -> list[str]:
@@ -43,88 +51,56 @@ def write_sample(path: str, layer_data: list[LayerDataTuple]) -> list[str]:
 
     bundle = _collect(layer_data)
     if not bundle.images:
-        raise ValueError("No image layers tagged medh5_role='image' to save")
+        raise ValueError("no image layers tagged medh5_role='image' to save")
 
     source = bundle.source_path
     if source and Path(source).resolve() == dest.resolve():
-        _save_inplace(dest, bundle)
+        _amend(dest, bundle)
     else:
-        _save_full(dest, bundle)
+        _write_new(dest, bundle)
     return [str(dest)]
 
 
 def _collect(layer_data: list[LayerDataTuple]) -> _Bundle:
-    images: dict[str, np.ndarray] = {}
-    seg: dict[str, np.ndarray] = {}
-    rect_payload: tuple[Any, dict[str, Any]] | None = None
-    source_paths: set[str] = set()
-    sample_shape: list[int] | None = None
+    bundle = _Bundle()
+    sources: set[str] = set()
 
-    for data, meta_kwargs, layer_type in layer_data:
-        m = _meta_dict(meta_kwargs)
-        role = m.get("medh5_role")
-        src = m.get("medh5_path")
-        if src:
-            source_paths.add(str(src))
+    for data, kwargs, layer_type in layer_data:
+        meta = _meta_dict(kwargs)
+        role = meta.get("medh5_role")
+        source = meta.get("medh5_path")
+        if source:
+            sources.add(str(source))
+
         if role == "image" and layer_type == "image":
-            name = str(m.get("medh5_name") or meta_kwargs.get("name") or "image")
-            arr = np.asarray(data)
-            images[name] = arr
-            if sample_shape is None:
-                sample_shape = list(arr.shape)
+            name = str(meta.get("medh5_name") or kwargs.get("name") or "image")
+            bundle.images[name] = np.asarray(data)
+            bundle.image_meta[name] = meta
         elif role == "seg" and layer_type == "labels":
-            name = str(m.get("medh5_name") or meta_kwargs.get("name") or "seg")
-            seg[name] = np.asarray(data).astype(bool)
+            name = str(meta.get("medh5_name") or kwargs.get("name") or "seg")
+            bundle.labelmaps[name] = np.asarray(data)
+            bundle.seg_meta[name] = meta
         elif role == "bbox_rect" and layer_type == "shapes":
-            rect_payload = (data, meta_kwargs)
+            name = str(meta.get("medh5_name") or kwargs.get("name") or "boxes")
+            bundle.boxes[name] = (data, kwargs, meta)
         elif role == "bbox_wire":
-            continue
+            continue  # a rendering of the rectangles, never a source of truth
 
-    if len(source_paths) > 1:
+    if len(sources) > 1:
         raise ValueError(
-            "Cannot save layers originating from multiple .medh5 files in one pass; "
-            f"got paths: {sorted(source_paths)}"
+            "cannot save layers from more than one .medh5 file in one pass; got "
+            f"{sorted(sources)}"
         )
-
-    bboxes: np.ndarray | None = None
-    scores: np.ndarray | None = None
-    labels: list[str] | None = None
-    if rect_payload is not None and sample_shape is not None:
-        data, meta_kwargs = rect_payload
-        shape_types = meta_kwargs.get("shape_type", "rectangle")
-        features = _features_as_dict(meta_kwargs.get("features"))
-        shape_sample = (
-            list(meta_kwargs.get("metadata", {}).get("sample_shape", sample_shape))
-            if isinstance(meta_kwargs.get("metadata"), dict)
-            else sample_shape
-        )
-        bboxes, scores, labels = shapes_to_arrays(
-            list(data) if data is not None else [],
-            shape_types,
-            features,
-            ndim=len(sample_shape),
-            sample_shape=shape_sample,
-        )
-
-    return _Bundle(
-        images=images,
-        seg=seg,
-        bboxes=bboxes,
-        bbox_scores=scores,
-        bbox_labels=labels,
-        sample_shape=sample_shape,
-        source_path=next(iter(source_paths), None),
-    )
+    bundle.source_path = next(iter(sources), None)
+    return bundle
 
 
-def _meta_dict(layer_kwargs: dict[str, Any]) -> dict[str, Any]:
-    raw = layer_kwargs.get("metadata") or {}
-    if isinstance(raw, dict):
-        return cast(dict[str, Any], raw)
-    return {}
+def _meta_dict(kwargs: dict[str, Any]) -> dict[str, Any]:
+    raw = kwargs.get("metadata") or {}
+    return cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
 
 
-def _features_as_dict(features: Any) -> dict[str, Any] | None:
+def _features(features: Any) -> dict[str, Any] | None:
     if features is None:
         return None
     if isinstance(features, dict):
@@ -137,104 +113,231 @@ def _features_as_dict(features: Any) -> dict[str, Any] | None:
     return None
 
 
-def _save_inplace(dest: Path, bundle: _Bundle) -> None:
-    # HDF5 forbids opening the same file twice in one process.  Close any
-    # registry handle before mutating; callers must re-read after saving.
-    REGISTRY.drop(dest)
-    sample = MEDH5File.read(dest)
-    source_images = set(sample.images.keys())
-    new_images = set(bundle.images.keys())
-    if source_images != new_images:
+def _masks_from(
+    labelmap: npt.NDArray[Any], meta: dict[str, Any]
+) -> dict[int, npt.NDArray[Any]]:
+    """Split an edited labelmap back into per-class masks.
+
+    Every class the annotation *declared* gets a mask, including ones the
+    editor left empty: a class that was examined and is now absent is a
+    verified negative (§11.3), and dropping it would turn that into "nobody
+    looked".
+    """
+    declared = [int(c) for c in meta.get("medh5_annotated") or ()]
+    present = [int(v) for v in np.unique(labelmap) if int(v) not in (0, 65535)]
+    for value in present:
+        if value not in declared:
+            declared.append(value)
+    return {class_id: labelmap == class_id for class_id in sorted(declared)}
+
+
+def _annotated(meta: dict[str, Any], masks: dict[int, npt.NDArray[Any]]) -> list[int]:
+    declared = [int(c) for c in meta.get("medh5_annotated") or ()]
+    return declared or sorted(masks)
+
+
+def _amend(dest: Path, bundle: _Bundle) -> None:
+    """Rewrite the annotations that changed, leaving everything else alone."""
+    # `amend` replaces the file, so a handle held across it would keep serving
+    # the old inode.  Drop first, rebind after.
+    with medh5.open(dest) as sample:
+        source_images = set(sample.images)
+        source_shapes = {k: tuple(v.shape) for k, v in sample.images.items()}
+        grids = {k: v.grid_id for k, v in sample.annotations.items()}
+        ann_grids = dict(grids)
+        image_grids = {k: v.grid_id for k, v in sample.images.items()}
+        ann_timepoints = {k: list(v.timepoints) for k, v in sample.annotations.items()}
+        existing = set(sample.annotations)
+
+    if source_images != set(bundle.images):
         raise ValueError(
-            "Image modalities differ from source file "
-            f"({sorted(source_images)} vs {sorted(new_images)}); "
-            "use Save As to write a new file."
+            f"image set differs from the source ({sorted(source_images)} vs "
+            f"{sorted(bundle.images)}); use Save As to write a new file"
         )
-    for name, arr in bundle.images.items():
-        if arr.shape != sample.images[name].shape:
+    for name, array in bundle.images.items():
+        if tuple(array.shape) != source_shapes[name]:
             raise ValueError(
-                f"Image '{name}' shape {arr.shape} differs from source "
-                f"{sample.images[name].shape}; use Save As to write a new file."
+                f"image {name!r} is {array.shape}, the source is "
+                f"{source_shapes[name]}; use Save As to write a new file"
             )
 
-    prev_seg = dict(sample.seg or {})
-    add: dict[str, np.ndarray] = {}
-    replace: dict[str, np.ndarray] = {}
-    for name, mask in bundle.seg.items():
-        if name in prev_seg:
-            if not np.array_equal(mask, prev_seg[name]):
-                replace[name] = mask
+    REGISTRY.drop(dest)
+    with medh5.amend(dest) as writer:
+        agent = writer.software(AGENT, _version())
+        activity = writer.activity("annotate", agent=agent, tool="napari")
+
+        for name, labelmap in bundle.labelmaps.items():
+            meta = bundle.seg_meta[name]
+            grid = ann_grids.get(name) or meta.get("medh5_grid")
+            if grid is None:
+                grid = next(iter(image_grids.values()))
+            masks = _masks_from(labelmap, meta)
+            if name in existing:
+                writer.remove_annotation(name)
+            writer.add_segmentation(
+                name,
+                grid=grid,
+                masks=masks,
+                annotated_classes=_annotated(meta, masks),
+                timepoints=ann_timepoints.get(name) or None,
+                prov=activity,
+            )
+
+        for name, (data, kwargs, meta) in bundle.boxes.items():
+            grid = ann_grids.get(name) or meta.get("medh5_grid")
+            if grid is None:
+                grid = next(iter(image_grids.values()))
+            _write_boxes(writer, name, data, kwargs, grid, activity, existing)
+
+    rebind_viewer_layers(dest)
+
+
+def _write_boxes(
+    writer: Any,
+    name: str,
+    data: Any,
+    kwargs: dict[str, Any],
+    grid: str,
+    activity: Any,
+    existing: set[str],
+) -> None:
+    meta = _meta_dict(kwargs)
+    shape = meta.get("sample_shape") or []
+    boxes, class_ids, scores, instance_ids = shapes_to_boxes(
+        list(data) if data is not None else [],
+        kwargs.get("shape_type", "rectangle"),
+        _features(kwargs.get("features")),
+        ndim=len(shape) if shape else 3,
+    )
+    if name in existing:
+        writer.remove_annotation(name)
+    if boxes is None or class_ids is None:
+        return  # every box was deleted in the viewer
+    writer.add_boxes(
+        name,
+        boxes=boxes,
+        class_ids=class_ids,
+        grid=grid,
+        space="index",
+        scores=scores,
+        instance_ids=instance_ids,
+        prov=activity,
+    )
+
+
+def _write_new(dest: Path, bundle: _Bundle) -> None:
+    """Write a fresh sample, carrying what the source can supply."""
+    source = bundle.source_path
+    document = None
+    grids: dict[str, Any] = {}
+    if source and Path(source).exists():
+        with medh5.open(source) as sample:
+            document = sample.document
+            grids = {k: v for k, v in sample.grids.items()}
+
+    first = next(iter(bundle.images.values()))
+    with medh5.create(
+        dest,
+        sample_id=document.identity.sample_id if document else dest.stem,
+        subject_id=document.identity.subject_id if document else dest.stem,
+    ) as writer:
+        if document is not None:
+            writer.identity(**document.identity.to_json())
+            writer.cohort(**document.cohort.to_json())
+            for timepoint in document.timepoints:
+                fields = timepoint.to_json()
+                writer.add_timepoint(str(fields.pop("id")), **fields)
+            if document.label_set is not None:
+                writer.label_set(document.label_set)
+            for namespace, value in document.extra.items():
+                writer.extra(namespace, value)
         else:
-            add[name] = mask
-    remove = [n for n in prev_seg if n not in bundle.seg]
-    seg_ops: dict[str, Any] = {}
-    if add:
-        seg_ops["add"] = add
-    if replace:
-        seg_ops["replace"] = replace
-    if remove:
-        seg_ops["remove"] = remove
+            writer.add_timepoint("tp0")
 
-    bbox_ops: dict[str, Any] = {}
-    if bundle.bboxes is None:
-        if sample.bboxes is not None:
-            bbox_ops["clear"] = True
-    else:
-        bbox_ops["bboxes"] = bundle.bboxes
-        bbox_ops["bbox_scores"] = bundle.bbox_scores
-        bbox_ops["bbox_labels"] = bundle.bbox_labels
+        agent = writer.software(AGENT, _version())
+        activity = writer.activity("annotate", agent=agent, tool="napari")
 
-    if not seg_ops and not bbox_ops:
-        # Still re-acquire so any lazy layer arrays keep working, since we
-        # closed the handle above. Without this, scrolling after a no-op save
-        # would read from a dead ``h5py.File``.
-        rebind_viewer_layers(dest)
-        return
+        written_grids = _declare_grids(writer, bundle, grids, first)
 
-    # ``on_reopened`` is medh5's blessed post-write hook (added in 0.6.0):
-    # invoked with *dest* after the write handle closes successfully. It
-    # pairs with our pre-write ``REGISTRY.drop`` to re-attach lazy dask
-    # views to the freshly reopened datasets, so existing image/seg
-    # layers stay usable after the in-place mutation.
-    MEDH5File.update(
-        dest,
-        seg_ops=seg_ops or None,
-        bbox_ops=bbox_ops or None,
-        on_reopened=rebind_viewer_layers,
-    )
+        for name, array in bundle.images.items():
+            meta = bundle.image_meta.get(name, {})
+            writer.add_image(
+                name,
+                array,
+                grid=written_grids[name],
+                modality=str(meta.get("modality") or "OT"),
+                value_units=meta.get("value_units"),
+                prov=activity,
+            )
+
+        for name, labelmap in bundle.labelmaps.items():
+            meta = bundle.seg_meta[name]
+            masks = _masks_from(labelmap, meta)
+            writer.add_segmentation(
+                name,
+                grid=_grid_for(meta, written_grids),
+                masks=masks,
+                annotated_classes=_annotated(meta, masks),
+                prov=activity,
+            )
+
+        for name, (data, kwargs, meta) in bundle.boxes.items():
+            _write_boxes(
+                writer,
+                name,
+                data,
+                kwargs,
+                _grid_for(meta, written_grids),
+                activity,
+                set(),
+            )
 
 
-def _save_full(dest: Path, bundle: _Bundle) -> None:
-    meta_kwargs: dict[str, Any] = {}
-    if bundle.source_path and Path(bundle.source_path).exists():
-        meta = MEDH5File.read_meta(bundle.source_path)
-        if meta.label is not None:
-            meta_kwargs["label"] = meta.label
-        if meta.label_name is not None:
-            meta_kwargs["label_name"] = meta.label_name
-        if meta.patch_size is not None:
-            meta_kwargs["patch_size"] = meta.patch_size
-        if meta.extra is not None:
-            meta_kwargs["extra"] = meta.extra
-        s = meta.spatial
-        if s.spacing is not None:
-            meta_kwargs["spacing"] = s.spacing
-        if s.origin is not None:
-            meta_kwargs["origin"] = s.origin
-        if s.direction is not None:
-            meta_kwargs["direction"] = s.direction
-        if s.axis_labels is not None:
-            meta_kwargs["axis_labels"] = s.axis_labels
-        if s.coord_system is not None:
-            meta_kwargs["coord_system"] = s.coord_system
+def _declare_grids(
+    writer: Any, bundle: _Bundle, source_grids: dict[str, Any], first: npt.NDArray[Any]
+) -> dict[str, str]:
+    """Declare one grid per distinct source grid, reusing its geometry.
 
-    MEDH5File.write(
-        dest,
-        images=bundle.images,
-        seg=bundle.seg or None,
-        bboxes=bundle.bboxes,
-        bbox_scores=bundle.bbox_scores,
-        bbox_labels=bundle.bbox_labels,
-        checksum=True,
-        **meta_kwargs,
-    )
+    Geometry is never invented: without a source grid the fallback is unit
+    spacing at the origin, which is what an image with no stated geometry
+    actually means.
+    """
+    out: dict[str, str] = {}
+    declared: set[str] = set()
+    for name, array in bundle.images.items():
+        grid_id = str(bundle.image_meta.get(name, {}).get("medh5_grid") or "grid")
+        if grid_id not in declared:
+            source = source_grids.get(grid_id)
+            if source is not None and tuple(source.shape) == tuple(array.shape):
+                writer.add_grid(
+                    grid_id,
+                    shape=source.shape,
+                    spacing=source.spacing,
+                    origin=source.origin,
+                    direction=source.direction,
+                    coord_system=source.coord_system,
+                    units=source.units,
+                    timepoint=source.timepoint,
+                    frame_uid=source.frame_uid,
+                )
+            else:
+                writer.add_grid(grid_id, shape=array.shape, spacing=(1.0,) * array.ndim)
+            declared.add(grid_id)
+        out[name] = grid_id
+    return out
+
+
+def _grid_for(meta: dict[str, Any], written: dict[str, str]) -> str:
+    grid = meta.get("medh5_grid")
+    if grid and grid in set(written.values()):
+        return str(grid)
+    return next(iter(written.values()))
+
+
+def _version() -> str:
+    from napari_medh5 import __version__
+
+    return __version__
+
+
+__all__ = ["write_sample"]

@@ -25,72 +25,195 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import medh5
 import numpy as np
 import pytest
-from medh5 import MEDH5File
+from medh5 import LabelClass, LabelSet
+
+LABELS = LabelSet(
+    "napari-test-v1",
+    version="1.0.0",
+    classes=[
+        # The tumor is *inside* the organ, and the label set says so (§5.1).
+        # That is what lets the viewer paint the specific class on top instead
+        # of burying it under the one that contains it.
+        LabelClass(1, "tumor", "Tumor", parents=[3], category="lesion"),
+        LabelClass(2, "incidental", "Incidental finding"),
+        LabelClass(3, "organ", "Organ", category="organ"),
+    ],
+)
+
+
+def build_sample(
+    path: Path,
+    *,
+    shape: tuple[int, ...] = (8, 16, 16),
+    spacing: tuple[float, ...] = (2.0, 1.0, 1.0),
+    origin: tuple[float, ...] = (0.0, 0.0, 0.0),
+    direction: Any | None = None,
+    masks: dict[Any, Any] | None = None,
+    boxes: Any = None,
+    class_ids: list[int] | None = None,
+    scores: list[float] | None = None,
+    timepoints: tuple[str, ...] = ("tp0",),
+    label_set: LabelSet | None = LABELS,
+    images: dict[str, Any] | None = None,
+) -> Path:
+    """A 1.0 sample built through the public writer.
+
+    Every fixture goes through this, so a test that reads one is also a test
+    that the writer produced something readable.
+    """
+    rng = np.random.default_rng(0)
+    if images is None:
+        images = {
+            "CT": rng.integers(-100, 300, size=shape, dtype=np.int16),
+            "PET": rng.random(size=shape, dtype=np.float32),
+        }
+    with medh5.create(path, sample_id=path.stem, subject_id="SUBJ-1") as writer:
+        if label_set is not None:
+            writer.label_set(label_set)
+        for index, timepoint in enumerate(timepoints):
+            writer.add_timepoint(timepoint, index=index, days_from_baseline=90 * index)
+        tool = writer.software("test-suite", "1.0")
+        activity = writer.activity("import", agent=tool, tool="conftest")
+        for index, timepoint in enumerate(timepoints):
+            grid = f"g_{timepoint}"
+            writer.add_grid(
+                grid,
+                shape=shape,
+                spacing=spacing,
+                origin=origin,
+                direction=direction,
+                timepoint=timepoint,
+                frame_uid=f"pseudo:frame-{timepoint}",
+            )
+            for name, array in images.items():
+                writer.add_image(
+                    f"{name}_{timepoint}" if len(timepoints) > 1 else name,
+                    array,
+                    grid=grid,
+                    modality="CT" if name == "CT" else "PT",
+                    prov=activity,
+                )
+            if masks:
+                writer.add_segmentation(
+                    f"seg_{timepoint}" if len(timepoints) > 1 else "seg",
+                    grid=grid,
+                    masks=masks,
+                    annotated_classes=[1, 2, 3]
+                    if label_set is not None
+                    else "all_given",
+                    prov=activity,
+                )
+            if boxes is not None and index == 0:
+                writer.add_boxes(
+                    "boxes",
+                    boxes=np.asarray(boxes, dtype=np.float32),
+                    class_ids=class_ids or [1] * len(boxes),
+                    grid=grid,
+                    space="index",
+                    scores=scores,
+                    prov=activity,
+                )
+    return path
+
+
+@pytest.fixture
+def label_set() -> LabelSet:
+    return LABELS
 
 
 @pytest.fixture
 def tiny_medh5(tmp_path: Path) -> Path:
-    """Build a small two-modality sample with one seg class and two bboxes."""
-    rng = np.random.default_rng(0)
+    """Two modalities, one segmentation with two classes, two boxes."""
     shape = (8, 16, 16)
-    images = {
-        "CT": rng.integers(-100, 300, size=shape, dtype=np.int16),
-        "PET": rng.random(size=shape, dtype=np.float32),
-    }
-    seg = {"tumor": np.zeros(shape, dtype=bool)}
-    seg["tumor"][2:5, 4:10, 4:10] = True
-    bboxes = np.array(
-        [
-            [[2, 5], [4, 10], [4, 10]],
-            [[1, 3], [1, 5], [1, 5]],
+    tumor = np.zeros(shape, dtype=bool)
+    tumor[2:5, 4:10, 4:10] = True
+    organ = np.zeros(shape, dtype=bool)
+    organ[1:7, 2:14, 2:14] = True
+    return build_sample(
+        tmp_path / "tiny.medh5",
+        shape=shape,
+        masks={1: tumor, 3: organ},
+        # Voxel edges (§8.1): [1.5, 4.5] is exactly slice(2, 5).
+        boxes=[
+            [[1.5, 4.5], [3.5, 9.5], [3.5, 9.5]],
+            [[0.5, 2.5], [0.5, 4.5], [0.5, 4.5]],
         ],
-        dtype=np.float64,
+        class_ids=[1, 2],
+        scores=[0.9, 0.5],
     )
-    bbox_scores = np.array([0.9, 0.5], dtype=np.float32)
-    bbox_labels = ["tumor", "incidental"]
-
-    path = tmp_path / "tiny.medh5"
-    MEDH5File.write(
-        path,
-        images=images,
-        seg=seg,
-        bboxes=bboxes,
-        bbox_scores=bbox_scores,
-        bbox_labels=bbox_labels,
-        label=1,
-        label_name="present",
-        spacing=[2.0, 1.0, 1.0],
-        origin=[0.0, 0.0, 0.0],
-        axis_labels=["Z", "Y", "X"],
-        coord_system="RAS",
-        checksum=True,
-    )
-    return path
 
 
 @pytest.fixture
-def nnunet_medh5(tmp_path: Path) -> Path:
-    """Tiny sample with nnUNet v2 metadata in ``extra["nnunetv2"]``."""
-    shape = (4, 8, 8)
-    images = {"0": np.zeros(shape, dtype=np.float32)}
-    seg = {"1": np.zeros(shape, dtype=bool)}
-    path = tmp_path / "nnu.medh5"
-    MEDH5File.write(
-        path,
-        images=images,
-        seg=seg,
-        extra={
-            "nnunetv2": {
-                "channel_names": {"0": "CT"},
-                "labels": {"background": 0, "tumor": 1},
-                "numTraining": 1,
-                "file_ending": ".nii.gz",
-            }
-        },
+def longitudinal_medh5(tmp_path: Path) -> Path:
+    """Two visits, so layer names and timepoint tagging are exercised."""
+    shape = (8, 16, 16)
+    tumor = np.zeros(shape, dtype=bool)
+    tumor[2:5, 4:10, 4:10] = True
+    return build_sample(
+        tmp_path / "long.medh5",
+        shape=shape,
+        masks={1: tumor},
+        timepoints=("tp0", "tp1"),
     )
-    return path
+
+
+@pytest.fixture
+def bare_medh5(tmp_path: Path) -> Path:
+    """One image, no label set, no annotations."""
+    return build_sample(
+        tmp_path / "bare.medh5",
+        shape=(4, 8, 8),
+        label_set=None,
+        images={"CT": np.zeros((4, 8, 8), dtype=np.float32)},
+    )
+
+
+@pytest.fixture
+def rotated_medh5(tmp_path: Path) -> Path:
+    """A non-identity ``direction`` --- exercises the affine path."""
+    shape = (6, 10, 10)
+    mask = np.zeros(shape, dtype=bool)
+    mask[1:4, 2:6, 2:6] = True
+    return build_sample(
+        tmp_path / "rot.medh5",
+        shape=shape,
+        spacing=(1.0, 1.0, 1.0),
+        direction=[[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        masks={1: mask},
+        images={"CT": np.zeros(shape, dtype=np.float32)},
+    )
+
+
+@pytest.fixture
+def deep_bbox_medh5(tmp_path: Path) -> Path:
+    """A box deeper than one voxel on its shallowest axis --- triggers the wireframe."""
+    shape = (12, 16, 16)
+    return build_sample(
+        tmp_path / "deep.medh5",
+        shape=shape,
+        spacing=(1.0, 1.0, 1.0),
+        images={"CT": np.zeros(shape, dtype=np.float32)},
+        boxes=[[[1.5, 6.5], [3.5, 9.5], [3.5, 9.5]]],
+        class_ids=[1],
+        scores=[0.8],
+    )
+
+
+@pytest.fixture
+def corrupt_medh5(tiny_medh5: Path) -> Path:
+    """``tiny_medh5`` with one voxel flipped --- the file is valid, the digest is not.
+
+    Exactly what an external tool editing an array does, and the reason
+    ``verify`` reports per object rather than one yes/no.
+    """
+    with h5py.File(tiny_medh5, "r+") as handle:
+        dataset = handle["images/CT"]
+        original = int(dataset[0, 0, 0])
+        dataset[0, 0, 0] = np.int16(original ^ 0xFF)
+    return tiny_medh5
 
 
 @pytest.fixture
@@ -134,67 +257,6 @@ def make_widget_app() -> Callable[[], tuple[Any, Any]]:
         return widget, viewer
 
     return factory
-
-
-@pytest.fixture
-def rotated_medh5(tmp_path: Path) -> Path:
-    """Sample with a non-identity ``direction`` matrix — exercises the affine path."""
-    rng = np.random.default_rng(1)
-    shape = (6, 10, 10)
-    images = {"CT": rng.random(size=shape, dtype=np.float32)}
-    seg = {"m": np.zeros(shape, dtype=bool)}
-    # 90-degree rotation in the YZ plane; ensures _spatial_to_affine returns a
-    # non-None affine instead of falling back to scale/translate.
-    direction = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
-    path = tmp_path / "rot.medh5"
-    MEDH5File.write(
-        path,
-        images=images,
-        seg=seg,
-        spacing=[1.0, 1.0, 1.0],
-        origin=[0.0, 0.0, 0.0],
-        direction=direction,
-        axis_labels=["Z", "Y", "X"],
-        coord_system="RAS",
-        checksum=True,
-    )
-    return path
-
-
-@pytest.fixture
-def deep_bbox_medh5(tmp_path: Path) -> Path:
-    """Sample with a bbox whose depth-axis extent > 1 voxel — triggers wireframe."""
-    shape = (12, 16, 16)
-    images = {"CT": np.zeros(shape, dtype=np.float32)}
-    bboxes = np.array([[[2, 7], [4, 10], [4, 10]]], dtype=np.float64)
-    bbox_scores = np.array([0.8], dtype=np.float32)
-    bbox_labels = ["big"]
-    path = tmp_path / "deep.medh5"
-    MEDH5File.write(
-        path,
-        images=images,
-        bboxes=bboxes,
-        bbox_scores=bbox_scores,
-        bbox_labels=bbox_labels,
-        spacing=[1.0, 1.0, 1.0],
-        origin=[0.0, 0.0, 0.0],
-        checksum=True,
-    )
-    return path
-
-
-@pytest.fixture
-def corrupt_medh5(tiny_medh5: Path) -> Path:
-    """``tiny_medh5`` with a single byte flipped in ``images/CT`` — breaks checksum.
-
-    The file stays structurally valid so :func:`MEDH5File.read` still works;
-    only ``verify()`` should report a mismatch.
-    """
-    with h5py.File(tiny_medh5, "r+") as f:
-        ds = f["images/CT"]
-        original = int(ds[0, 0, 0])
-        ds[0, 0, 0] = np.int16(original ^ 0xFF)
-    return tiny_medh5
 
 
 @pytest.fixture

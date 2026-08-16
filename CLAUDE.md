@@ -12,55 +12,105 @@ ruff check . && ruff format --check . && mypy src && pytest -v
 
 Pytest runs with `--cov=napari_medh5 --cov-fail-under=90` by default (see `pyproject.toml`); the suite fails if coverage drops below 90%. To run a single test file or case, use the standard pytest selectors, e.g. `pytest tests/test_writer.py -v` or `pytest tests/test_writer.py::test_name -v`.
 
-Install for development (the core `medh5` library lives in a **sibling repo** and is not on PyPI — install it editable first):
+Install for development (`medh5` 1.0 is on PyPI; use the sibling repo when working on both):
 
 ```bash
-pip install -e "../medh5"
 pip install -e ".[dev]"
+pip install -e "../medh5"   # only when developing medh5 alongside
 ```
 
 Launch napari with the plugin: `napari --plugin napari-medh5 path/to/sample.medh5`. Dock widget is registered under **Plugins → Metadata & Review**.
 
 ## Architecture
 
-This is a napari plugin that wraps the external `medh5` library (sibling repo). The plugin exposes three contributions via `src/napari_medh5/napari.yaml`: a reader, a writer, and a dock widget. Several cross-file invariants are load-bearing and not obvious from any single file.
+A napari plugin wrapping the external `medh5` library (sibling repo), against
+**format 1.0**. Three contributions in `src/napari_medh5/napari.yaml`: a
+reader, a writer, and a dock widget. Several cross-file invariants are
+load-bearing and not obvious from any single file.
 
 ### Shared handle registry (`_handles.py`)
 
-Lazy `dask.array.from_array(h5py_dataset)` layers require the backing `h5py.File` to stay open for the lifetime of the napari layer. `REGISTRY` is a reference-counted, thread-locked map `{resolved_path: MEDH5File}`. The reader calls `REGISTRY.acquire(path)` per opened file; `attach_viewer()` wires `viewer.layers.events.removed` so the handle is released (and closed) when the last layer backed by a file is removed.
+Lazy `dask` layers need the backing `h5py.File` open for the layer's lifetime.
+`REGISTRY` is a reference-counted, thread-locked map `{resolved_path:
+medh5.Sample}`. The reader calls `REGISTRY.acquire(path)`; `attach_viewer()`
+wires `viewer.layers.events.removed` so the handle closes when the last layer
+backed by a file goes away.
 
-**Critical**: HDF5 forbids opening the same file twice in a single process. Before any in-place mutation (`MEDH5File.update`), callers must invoke `REGISTRY.drop(path)` to close the open handle — the writer does this in `_save_inplace`. After save, any still-attached lazy layer will raise on next access; callers re-read the file.
+**Critical, and for a different reason than in 0.x.** Any write must
+`REGISTRY.drop(path)` first. In 0.x that was because HDF5 refuses to open one
+file twice. In 1.0 `medh5.amend` is copy-on-write — it builds a new file and
+`os.replace`s it — so a handle held across the write keeps serving the *old
+inode* with no error at all. `rebind_viewer_layers` re-acquires and swaps
+`.data` on every affected layer, across every attached viewer, since the
+registry is process-global.
+
+### Lazy arrays (`_arrays.py`)
+
+An image is one dataset, so `image_array` is a direct `da.from_array`. A voxel
+annotation is not: five encodings sit behind one read contract and only
+`labelmap` stores anything a viewer can colour. `annotation_array` uses
+`map_blocks` over `VoxelAnnotation.labelmap(roi=...)`, so napari asks for the
+slice it is about to draw and medh5 decodes exactly that window out of
+whatever encoding is in the file.
+
+`draw_priority` decides which class wins an overlapping voxel. A napari
+`Labels` layer holds one id per voxel, and `labelmap(priority=...)` takes
+**highest precedence first**. A lesion inside an organ is a child of it in the
+label set DAG (§5.1); ordering by depth, deepest first, keeps the specific
+class visible instead of buried under the one containing it.
 
 ### Layer role tagging
 
-Every layer produced by the reader carries a `metadata` dict with:
-- `medh5_path`: resolved source-file path (used by the widget for sample discovery and by the writer to detect the source).
-- `medh5_role`: one of `"image"`, `"seg"`, `"bbox_rect"`, `"bbox_wire"`.
-- `medh5_name`: original key inside the medh5 file (preserves round-trip when display names are remapped, e.g. by nnU-Net labels).
+Every layer carries `metadata`:
+- `medh5_path` — resolved source file
+- `medh5_role` — `"image"`, `"seg"`, `"bbox_rect"`, `"bbox_wire"`
+- `medh5_name` — the object id inside the file
+- `medh5_grid`, `medh5_timepoint` — so the writer puts it back on the right grid
+- `medh5_classes` — `{class_id: display name}` from the label set
+- `medh5_annotated` — the classes that were *examined* (§11.3), so erasing a
+  mask does not turn "examined and absent" into "nobody looked"
 
-The writer's `_collect()` relies entirely on these tags — layers without `medh5_role` are silently ignored. If you add new layer kinds, extend both the reader tagging and the writer's dispatch.
+The writer's `_collect()` relies entirely on these; layers without
+`medh5_role` are ignored. New layer kinds need both the reader tagging and the
+writer dispatch.
 
-### Bbox round-trip (`_bbox.py`)
+### Boxes (`_bbox.py`)
 
-Medh5 stores bboxes as `(n, ndim, 2)` arrays. napari doesn't have a native 3D box primitive, so:
-- **Read**: each box projects onto its smallest-extent axis ("depth axis"); a rectangle is drawn on that axis's centre slice. Depth info is preserved in `features["depth_axis"|"depth_lo"|"depth_hi"]`. If any box spans more than one voxel along depth, a companion `bbox_wire` Shapes layer renders the full 3D cuboid as 12 line segments.
-- **Write**: the `bbox_rect` layer is authoritative. The wireframe companion (`bbox_wire`) is skipped by the writer. Depth extents come from the `features` columns, not from rectangle geometry.
+medh5 boxes are `float32` at voxel **edges** (§8.1); napari rectangles are at
+voxel **centres**. Every corner shifts by ±0.5 across the boundary, and a
+round trip that forgets it moves every box half a voxel per save with nothing
+raising. `EDGE_TO_CENTRE` is applied once on each side, and
+`TestRoundTrip::test_S8_1_a_box_survives_read_and_write_unchanged` holds it.
+
+napari has no 3-D box primitive, so a box is drawn as a rectangle on its
+shallowest axis's centre slice with the depth extent in
+`features["depth_axis"|"depth_lo"|"depth_hi"]`; a box deeper than one voxel
+also gets a 12-segment wireframe companion. On write the rectangle layer is
+authoritative and the wireframe is skipped. Nothing is rounded — 1.0 boxes are
+float, so a box drawn between two voxels stays between them.
 
 ### Writer modes (`_writer.py`)
 
-`write_sample` chooses between two paths:
-- **In-place** (`_save_inplace`): destination resolves to the same path as `medh5_path` AND image modality set + shapes match the source. Uses `MEDH5File.update(seg_ops=..., bbox_ops=...)` which preserves compression and only rewrites the changed sub-datasets.
-- **Full rewrite** (`_save_full`): any other case (Save As, added/removed modalities). Uses `MEDH5File.write()`; spatial/label metadata is copied from the source via `MEDH5File.read_meta(source)` if available. Dask arrays are materialised to numpy here.
+- **Amend** (`_amend`): destination is the source, and the image set and shapes
+  match. `medh5.amend` copies unknown objects through untouched, so only the
+  edited annotations are re-encoded.
+- **Full write** (`_write_new`): Save As, or a changed image set.
+  `medh5.create`, carrying identity, timepoints, label set and grid geometry
+  from the source where there is one. Geometry is never invented: with no
+  source grid the fallback is unit spacing at the origin.
 
-Multi-source saves (layers from different `medh5_path`s) are rejected.
+Both record an `annotate` provenance activity naming napari, so an edit made
+in a viewer is distinguishable from a model prediction later.
 
-### Spatial transforms (`_layers.py`)
+Multi-source saves are rejected.
 
-If the source `direction` matrix is identity (or absent), layers receive napari `scale` + `translate` kwargs. If direction is a non-identity rotation, layers receive a single `(ndim+1, ndim+1)` homogeneous `affine` instead — mixing `scale`/`translate` with rotation produces wrong geometry in napari.
+### Widget (`_widget.py`)
 
-### nnU-Net label surfacing
-
-If `meta.extra["nnunetv2"]["labels"]` is present (dict of `{class_name: value}`), seg layer names whose raw key is a bare integer are displayed as the class name (`:seg:tumor` instead of `:seg:1`). The widget also renders this mapping in its "nnU-Net v2 classes" group box. The `medh5_name` metadata always preserves the original raw key so writes round-trip correctly.
+Quality is recorded **per annotation** (§11.2), not per file — 0.x had one
+review status for the whole sample and could not say which of three masks was
+reviewed. Saving writes a `review` activity plus a quality record. The widget
+also shows the validator at a selectable level, per-object digest results, the
+label set, and the sample document.
 
 ## Tooling notes
 

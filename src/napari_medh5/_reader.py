@@ -6,10 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from napari_medh5._handles import REGISTRY, attach_viewer
-from napari_medh5._layers import file_to_layers
+from napari_medh5._layers import sample_to_layers
 from napari_medh5._types import LayerDataTuple
 
-_SUFFIX = ".medh5"
+_SUFFIXES = (".medh5", ".medh5c")
 
 
 def napari_get_reader(
@@ -17,7 +17,7 @@ def napari_get_reader(
 ) -> Callable[[str | list[str]], list[LayerDataTuple]] | None:
     """Return a reader callable if *path* can be opened."""
     paths = [path] if isinstance(path, str) else list(path)
-    if not paths or not all(Path(p).suffix == _SUFFIX for p in paths):
+    if not paths or not all(Path(p).suffix in _SUFFIXES for p in paths):
         return None
     return _read
 
@@ -26,9 +26,9 @@ def _read(path: str | list[str]) -> list[LayerDataTuple]:
     _attach_current_viewer()
     paths = [path] if isinstance(path, str) else list(path)
     layers: list[LayerDataTuple] = []
-    for p in paths:
-        handle = REGISTRY.acquire(p)
-        layers.extend(file_to_layers(handle, p))
+    for one in paths:
+        sample = REGISTRY.acquire(one)
+        layers.extend(sample_to_layers(sample, one))
     return layers
 
 
