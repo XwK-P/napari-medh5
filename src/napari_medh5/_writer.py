@@ -156,6 +156,9 @@ class _Source:
     ignores: dict[str, npt.NDArray[Any]] = field(default_factory=dict)
     #: Annotations whose ignore region the encoding will not hand back.
     opaque: set[str] = field(default_factory=set)
+    timepoints: dict[str, list[str]] = field(default_factory=dict)
+    provs: dict[str, str] = field(default_factory=dict)
+    qualities: dict[str, str] = field(default_factory=dict)
 
     def edited(self, name: str, current: npt.NDArray[Any]) -> bool:
         stored = self.maps.get(name)
@@ -177,6 +180,11 @@ def _capture(sample: Any, bundle: _Bundle, *, always: bool) -> _Source:
         )
         out.kinds[name] = str(annotation.kind)
         out.maps[name] = stored
+        out.timepoints[name] = [str(t) for t in annotation.timepoints]
+        if annotation.header.prov:
+            out.provs[name] = str(annotation.header.prov)
+        if annotation.header.quality:
+            out.qualities[name] = str(annotation.header.quality)
         if annotation.has_ignore_region:
             region = _source_ignore(annotation)
             if region is None:
@@ -294,8 +302,16 @@ def _merged_masks(
 
 
 def _annotated(meta: dict[str, Any], masks: dict[int, npt.NDArray[Any]]) -> list[int]:
-    declared = [int(c) for c in meta.get("medh5_annotated") or ()]
-    return declared or sorted(masks)
+    """Every class this annotation claims to have been examined for.
+
+    A class somebody painted was examined by definition, so it joins the
+    declared list rather than being left out of it.  Writing voxels for a class
+    that `annotated_classes` says nobody looked at is a contradiction --- it
+    turns a positive finding into "not examined", which is the one distinction
+    §11.3 exists to keep --- and the format rejects it outright.
+    """
+    declared = {int(c) for c in meta.get("medh5_annotated") or ()}
+    return sorted(declared | {int(c) for c in masks})
 
 
 def _amend(dest: Path, bundle: _Bundle) -> None:
@@ -435,6 +451,16 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
                 writer.label_set(document.label_set)
             for namespace, value in document.extra.items():
                 writer.extra(namespace, value)
+            # A copy of a reviewed sample is still reviewed.  Carrying only the
+            # identity left the destination with no quality records and no
+            # provenance but napari's own, so a sample somebody had approved
+            # came out looking untouched --- and the audit trail that says who
+            # drew what, a year later, is the thing this format is for.
+            for agent_record in document.provenance.agents:
+                writer.document.provenance.add_agent(agent_record)
+            for prior in document.provenance.activities:
+                writer.document.provenance.add_activity(prior)
+            writer.document.quality.update(document.quality)
         else:
             writer.add_timepoint("tp0")
 
@@ -465,7 +491,15 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
                 ignore=ignore,
                 encoding=encoding,
                 annotated_classes=_annotated(meta, masks),
-                prov=activity,
+                # A copy carries the source's association and its review; the
+                # napari activity only claims the ones napari actually touched.
+                timepoints=src.timepoints.get(name) or None,
+                quality=src.qualities.get(name),
+                prov=(
+                    activity
+                    if src.edited(name, current)
+                    else src.provs.get(name) or activity
+                ),
             )
 
         for name, (data, kwargs, meta) in bundle.boxes.items():

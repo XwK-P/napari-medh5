@@ -125,6 +125,42 @@ def _overlapping(
     return path
 
 
+def _reviewed(tmp_path: Path) -> Path:
+    """A sample somebody signed off, associated with two timepoints."""
+    from medh5.labels.labelset import LabelClass, LabelSet
+
+    shape = (8, 16, 16)
+    liver = np.zeros(shape, dtype=bool)
+    liver[2:6, 2:10, 2:10] = True
+    path = tmp_path / "reviewed.medh5"
+    with medh5.create(path, sample_id="s", subject_id="j", codec="portable") as w:
+        w.add_timepoint("tp0", days_from_baseline=0)
+        w.add_timepoint("tp1", days_from_baseline=90)
+        w.add_grid("g", shape=shape, spacing=(1.0, 1.0, 1.0), timepoint="tp0")
+        w.label_set(
+            LabelSet(
+                "t",
+                version="1.0.0",
+                classes=[
+                    LabelClass(1, "liver", "Liver"),
+                    LabelClass(3, "lesion", "Lesion"),
+                ],
+            )
+        )
+        w.add_image("CT", np.zeros(shape, dtype=np.int16), grid="g", modality="CT")
+        activity = w.activity("annotate", agent=w.person("Dr Reviewer"), tool="manual")
+        w.add_segmentation(
+            "organs",
+            grid="g",
+            masks={1: liver},
+            annotated_classes=[1],
+            timepoints=["tp0", "tp1"],
+            quality={"status": "approved"},
+            prov=activity,
+        )
+    return path
+
+
 def _overlap_state(path: Path) -> tuple[str, int, int]:
     """``(kind, overlapping voxels, liver voxels)``."""
     with medh5.open(path) as sample:
@@ -357,6 +393,48 @@ class TestSaveAs:
         assert _overlap_state(dest) == ("layers", 18, 257)
         with medh5.open(dest) as sample:
             assert sample.annotations["organs"].contains(1, (0, 0, 0))
+
+    def test_S11_a_copy_of_a_reviewed_sample_is_still_reviewed(self, tmp_path):
+        """Save As carried the identity and left the audit trail behind.
+
+        A sample somebody had approved came out with no quality record and no
+        provenance but napari's own --- looking untouched.  Who drew what, and
+        whether anybody signed it off, is the thing §11 is for.
+        """
+        source = _reviewed(tmp_path)
+        dest = tmp_path / "copy.medh5"
+
+        write_sample(str(dest), materialise(read_layers(source)))
+
+        with medh5.open(dest) as sample:
+            annotation = sample.annotations["organs"]
+            record = sample.document.quality_of(annotation.header.quality)
+            assert record is not None and record.status == "approved"
+            agents = {a.name for a in sample.document.provenance.agents}
+            assert "Dr Reviewer" in agents, "the reviewer survived the copy"
+            assert "napari-medh5" in agents, "and napari recorded its own pass"
+            assert list(annotation.timepoints) == ["tp0", "tp1"]
+
+    def test_S11_3_a_painted_class_counts_as_examined(self, tmp_path):
+        """Voxels for a class `annotated_classes` excludes is a contradiction.
+
+        `annotated_classes` says what was *looked for*; a class somebody just
+        painted was looked for by definition.  Declaring otherwise turns a
+        positive finding into "nobody examined this".
+        """
+        source = _reviewed(tmp_path)
+        layers = materialise(read_layers(source))
+        for data, kwargs, _kind in layers:
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                data[0, 0, 0] = 3  # a class the source never declared
+
+        dest = tmp_path / "painted.medh5"
+        write_sample(str(dest), layers)
+
+        with medh5.open(dest) as sample:
+            annotation = sample.annotations["organs"]
+            assert list(annotation.annotated_class_ids) == [1, 3]
+            assert annotation.contains(3, (0, 0, 0))
 
     def test_a_missing_extension_is_added(self, tiny_medh5, tmp_path):
         written = write_sample(
