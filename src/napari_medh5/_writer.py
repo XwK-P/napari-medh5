@@ -26,6 +26,7 @@ import medh5
 import numpy as np
 import numpy.typing as npt
 
+from napari_medh5._arrays import LABEL_DTYPE, draw_priority
 from napari_medh5._bbox import shapes_to_boxes
 from napari_medh5._handles import REGISTRY, rebind_viewer_layers
 from napari_medh5._types import LayerDataTuple
@@ -131,6 +132,58 @@ def _masks_from(
     return {class_id: labelmap == class_id for class_id in sorted(declared)}
 
 
+#: Encodings a single labelmap cannot carry back: a voxel holds one id, and
+#: these hold more than that per voxel, so no merge recovers them.
+RICH_KINDS = ("probmap", "instances")
+
+#: Encodings that are per-class masks, and so survive a merge unchanged.
+MASK_KINDS = ("labelmap", "layers", "bitmask")
+
+
+def _refuse_lossy(name: str, kind: str | None) -> None:
+    """Refuse only the edits nothing can reconstruct.
+
+    A labelmap holds one id per voxel, so it cannot carry a probability or an
+    instance identity back at all --- there is no merge that recovers those,
+    and the file being overwritten is the only copy.  Overlapping *classes* are
+    a different case and are handled by :func:`_merged_masks`.
+    """
+    if kind in RICH_KINDS:
+        raise ValueError(
+            f"annotation {name!r} is a {kind!r} annotation, and napari edits it "
+            "as a labelmap of one id per voxel; saving would replace the "
+            f"{kind} with a hard segmentation. Edit it with a tool that can "
+            "write that encoding, or save to a new file under a new name."
+        )
+
+
+def _merged_masks(
+    current: npt.NDArray[Any],
+    stored: npt.NDArray[Any],
+    masks: dict[int, npt.NDArray[Any]],
+    meta: dict[str, Any],
+) -> dict[int, npt.NDArray[Any]]:
+    """Take the edit where the labelmap changed; keep the file everywhere else.
+
+    napari holds one id per voxel, so what it hands back cannot express two
+    classes claiming the same voxel.  Rebuilding the whole annotation from it
+    therefore deleted every overlap in the file --- including all the ones the
+    editor never went near.  Only the voxels that actually changed take their
+    class from the viewer; the rest keep exactly what was stored, overlaps
+    intact.
+    """
+    changed = current != stored
+    out = {int(c): np.asarray(m, dtype=bool).copy() for c, m in masks.items()}
+    for value in np.unique(current[changed]) if changed.any() else ():
+        if int(value) not in (0, 65535):
+            out.setdefault(int(value), np.zeros(current.shape, dtype=bool))
+    for class_id in [int(c) for c in meta.get("medh5_annotated") or ()]:
+        out.setdefault(class_id, np.zeros(current.shape, dtype=bool))
+    for class_id, mask in out.items():
+        mask[changed] = current[changed] == class_id
+    return dict(sorted(out.items()))
+
+
 def _annotated(meta: dict[str, Any], masks: dict[int, npt.NDArray[Any]]) -> list[int]:
     declared = [int(c) for c in meta.get("medh5_annotated") or ()]
     return declared or sorted(masks)
@@ -148,6 +201,32 @@ def _amend(dest: Path, bundle: _Bundle) -> None:
         image_grids = {k: v.grid_id for k, v in sample.images.items()}
         ann_timepoints = {k: list(v.timepoints) for k, v in sample.annotations.items()}
         existing = set(sample.annotations)
+        source_kinds = {k: v.kind for k, v in sample.annotations.items()}
+        # What the reader put on screen, recomputed the same way, so an
+        # annotation nobody touched compares equal and is left alone.
+        source_maps = {
+            name: np.asarray(
+                annotation.labelmap(priority=draw_priority(annotation)),
+                dtype=LABEL_DTYPE,
+            )
+            for name, annotation in sample.annotations.items()
+            if hasattr(annotation, "labelmap")
+        }
+        # Per-class masks, captured only for the annotations that actually
+        # changed, since the sample is closed before `amend` reopens the file.
+        source_masks = {
+            name: {
+                int(c): np.asarray(annotation.dense([int(c)])[0])
+                for c in annotation.class_ids
+            }
+            for name, annotation in sample.annotations.items()
+            if name in source_maps
+            and name in bundle.labelmaps
+            and not np.array_equal(
+                np.asarray(bundle.labelmaps[name], dtype=LABEL_DTYPE),
+                source_maps[name],
+            )
+        }
 
     if source_images != set(bundle.images):
         raise ValueError(
@@ -168,16 +247,34 @@ def _amend(dest: Path, bundle: _Bundle) -> None:
 
         for name, labelmap in bundle.labelmaps.items():
             meta = bundle.seg_meta[name]
+            current = np.asarray(labelmap, dtype=LABEL_DTYPE)
+            source = source_maps.get(name)
+            if source is not None and np.array_equal(current, source):
+                # Untouched.  `amend` is copy-on-write and carries it through
+                # exactly as it was --- encoding, overlaps and all.  Re-encoding
+                # it from what the viewer displayed is how merely *saving* used
+                # to delete every voxel where two classes overlapped.
+                continue
+            kind = source_kinds.get(name)
+            _refuse_lossy(name, kind)
             grid = ann_grids.get(name) or meta.get("medh5_grid")
             if grid is None:
                 grid = next(iter(image_grids.values()))
-            masks = _masks_from(labelmap, meta)
+            masks = (
+                _merged_masks(current, source, source_masks[name], meta)
+                if source is not None and name in source_masks
+                else _masks_from(labelmap, meta)
+            )
             if name in existing:
                 writer.remove_annotation(name)
             writer.add_segmentation(
                 name,
                 grid=grid,
                 masks=masks,
+                # Keep the encoding the file chose.  Re-selecting would quietly
+                # demote a `layers` annotation to `labelmap` the first time its
+                # overlaps happened to fall outside the edit.
+                encoding=kind if kind in MASK_KINDS else "auto",
                 annotated_classes=_annotated(meta, masks),
                 timepoints=ann_timepoints.get(name) or None,
                 prov=activity,
@@ -257,7 +354,7 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
         agent = writer.software(AGENT, _version())
         activity = writer.activity("annotate", agent=agent, tool="napari")
 
-        written_grids = _declare_grids(writer, bundle, grids, first)
+        written_grids, declared_grids = _declare_grids(writer, bundle, grids, first)
 
         for name, array in bundle.images.items():
             meta = bundle.image_meta.get(name, {})
@@ -275,7 +372,7 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
             masks = _masks_from(labelmap, meta)
             writer.add_segmentation(
                 name,
-                grid=_grid_for(meta, written_grids),
+                grid=_grid_for(meta, written_grids, declared_grids),
                 masks=masks,
                 annotated_classes=_annotated(meta, masks),
                 prov=activity,
@@ -287,7 +384,7 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
                 name,
                 data,
                 kwargs,
-                _grid_for(meta, written_grids),
+                _grid_for(meta, written_grids, declared_grids),
                 activity,
                 set(),
             )
@@ -295,7 +392,7 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
 
 def _declare_grids(
     writer: Any, bundle: _Bundle, source_grids: dict[str, Any], first: npt.NDArray[Any]
-) -> dict[str, str]:
+) -> tuple[dict[str, str], set[str]]:
     """Declare one grid per distinct source grid, reusing its geometry.
 
     Geometry is never invented: without a source grid the fallback is unit
@@ -304,32 +401,55 @@ def _declare_grids(
     """
     out: dict[str, str] = {}
     declared: set[str] = set()
+
+    def declare(grid_id: str, shape: tuple[int, ...] | None) -> None:
+        if grid_id in declared:
+            return
+        source = source_grids.get(grid_id)
+        if source is not None and (shape is None or tuple(source.shape) == shape):
+            writer.add_grid(
+                grid_id,
+                shape=source.shape,
+                spacing=source.spacing,
+                origin=source.origin,
+                direction=source.direction,
+                coord_system=source.coord_system,
+                units=source.units,
+                timepoint=source.timepoint,
+                frame_uid=source.frame_uid,
+            )
+        elif shape is not None:
+            writer.add_grid(grid_id, shape=shape, spacing=(1.0,) * len(shape))
+        else:
+            return
+        declared.add(grid_id)
+
     for name, array in bundle.images.items():
         grid_id = str(bundle.image_meta.get(name, {}).get("medh5_grid") or "grid")
-        if grid_id not in declared:
-            source = source_grids.get(grid_id)
-            if source is not None and tuple(source.shape) == tuple(array.shape):
-                writer.add_grid(
-                    grid_id,
-                    shape=source.shape,
-                    spacing=source.spacing,
-                    origin=source.origin,
-                    direction=source.direction,
-                    coord_system=source.coord_system,
-                    units=source.units,
-                    timepoint=source.timepoint,
-                    frame_uid=source.frame_uid,
-                )
-            else:
-                writer.add_grid(grid_id, shape=array.shape, spacing=(1.0,) * array.ndim)
-            declared.add(grid_id)
+        declare(grid_id, tuple(array.shape))
         out[name] = grid_id
-    return out
+
+    # Annotations may sit on a grid no image uses --- a segmentation at its own
+    # spacing, a detection on the grid it was run against.  Declaring only the
+    # image grids left `_grid_for` to substitute the first image grid, which
+    # either fails outright on a shape mismatch or, worse, succeeds and gives
+    # the annotation somebody else's spacing, origin and frame of reference.
+    for meta in (*bundle.seg_meta.values(), *(m for _, _, m in bundle.boxes.values())):
+        referenced = meta.get("medh5_grid")
+        if referenced:
+            declare(str(referenced), None)
+    return out, declared
 
 
-def _grid_for(meta: dict[str, Any], written: dict[str, str]) -> str:
+def _grid_for(meta: dict[str, Any], written: dict[str, str], declared: set[str]) -> str:
+    """The grid an annotation belongs on --- its own wherever that exists.
+
+    Falling back to an image grid is a last resort for a layer naming a grid
+    the source does not have, and it is a substitution: the annotation keeps
+    its voxels and takes somebody else's spacing, origin and frame.
+    """
     grid = meta.get("medh5_grid")
-    if grid and grid in set(written.values()):
+    if grid and str(grid) in declared:
         return str(grid)
     return next(iter(written.values()))
 

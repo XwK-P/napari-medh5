@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import medh5
@@ -81,6 +82,48 @@ class TestMasksFromLabelmap:
         assert _masks_from(labelmap, {}) == {}
 
 
+def _overlapping(tmp_path: Path) -> Path:
+    """A sample whose lesion sits inside its liver, in an encoding that allows it."""
+    from medh5.labels.labelset import LabelClass, LabelSet
+
+    shape = (8, 16, 16)
+    liver = np.zeros(shape, dtype=bool)
+    liver[2:6, 2:10, 2:10] = True
+    lesion = np.zeros(shape, dtype=bool)
+    lesion[3:5, 4:7, 4:7] = True
+    path = tmp_path / "overlap.medh5"
+    with medh5.create(path, sample_id="s", subject_id="subj", codec="portable") as w:
+        w.add_grid("g", shape=shape, spacing=(1.0, 1.0, 1.0))
+        w.add_image("CT", np.zeros(shape, dtype=np.int16), grid="g", modality="CT")
+        w.label_set(
+            LabelSet(
+                "t",
+                version="1.0.0",
+                classes=[
+                    LabelClass(1, "liver", "Liver"),
+                    LabelClass(3, "lesion", "Lesion", parents=[1]),
+                ],
+            )
+        )
+        w.add_segmentation(
+            "organs",
+            grid="g",
+            masks={1: liver, 3: lesion},
+            encoding="layers",
+            annotated_classes=[1, 3],
+        )
+    return path
+
+
+def _overlap_state(path: Path) -> tuple[str, int, int]:
+    """``(kind, overlapping voxels, liver voxels)``."""
+    with medh5.open(path) as sample:
+        annotation = sample.annotations["organs"]
+        liver = annotation.dense([1])[0]
+        lesion = annotation.dense([3])[0]
+        return str(annotation.kind), int((liver & lesion).sum()), int(liver.sum())
+
+
 class TestAmend:
     def test_a_seg_edit_persists(self, tiny_medh5):
         layers = materialise(read_layers(tiny_medh5))
@@ -90,6 +133,43 @@ class TestAmend:
         write_sample(str(tiny_medh5), layers)
         with medh5.open(tiny_medh5) as sample:
             assert sample.annotations["seg"].contains(1, (0, 0, 0))
+
+    def test_S7_saving_without_editing_changes_nothing(self, tmp_path):
+        """Opening a file and pressing save must not cost the user data.
+
+        napari collapses an annotation to one id per voxel to display it.
+        Re-encoding every annotation from that view on every amend meant a save
+        with no edits at all deleted each voxel where two classes overlapped,
+        and demoted `layers` to `labelmap` on the way past.
+        """
+        path = _overlapping(tmp_path)
+        before = _overlap_state(path)
+        assert before == ("layers", 18, 256), "the fixture overlaps to begin with"
+
+        write_sample(str(path), materialise(read_layers(path)))
+
+        assert _overlap_state(path) == before
+
+    def test_S7_an_edit_keeps_the_overlaps_it_did_not_touch(self, tmp_path):
+        """The edit wins where it landed; the file wins everywhere else.
+
+        A labelmap cannot express two classes on one voxel, so rebuilding the
+        annotation from it discards every overlap --- including all the ones
+        the editor never went near.  Only the changed voxels take their class
+        from the viewer.
+        """
+        path = _overlapping(tmp_path)
+        layers = materialise(read_layers(path))
+        for data, kwargs, _kind in layers:
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                data[0, 0, 0] = 1  # somewhere far from the overlap
+
+        write_sample(str(path), layers)
+
+        kind, overlap, liver = _overlap_state(path)
+        assert (kind, overlap, liver) == ("layers", 18, 257), "overlap kept, edit added"
+        with medh5.open(path) as sample:
+            assert sample.annotations["organs"].contains(1, (0, 0, 0))
 
     def test_everything_else_survives_the_amend(self, tiny_medh5):
         with medh5.open(tiny_medh5) as sample:
@@ -160,6 +240,39 @@ class TestSaveAs:
             str(dest)
         ]
         assert dest.exists()
+
+    def test_S3_an_annotation_keeps_the_grid_it_was_stored_on(self, tmp_path):
+        """A segmentation may sit on its own grid, at its own spacing.
+
+        Only the grids images referenced were declared, so `_grid_for` had
+        nothing to match and substituted the first image grid --- which fails
+        outright on a shape mismatch and, where the shapes happen to agree,
+        quietly hands the annotation somebody else's spacing, origin and frame
+        of reference.
+        """
+        shape = (8, 16, 16)
+        mask = np.zeros(shape, dtype=bool)
+        mask[2:6, 2:10, 2:10] = True
+        source = tmp_path / "src.medh5"
+        with medh5.create(source, sample_id="s", subject_id="j", codec="portable") as w:
+            w.add_grid(
+                "ct", shape=shape, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0)
+            )
+            w.add_grid(
+                "seg", shape=shape, spacing=(2.5, 0.8, 0.8), origin=(-4.0, -6.0, -6.0)
+            )
+            w.add_image("CT", np.zeros(shape, dtype=np.int16), grid="ct", modality="CT")
+            w.add_segmentation("organs", grid="seg", masks={1: mask})
+
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(source)))
+
+        with medh5.open(dest) as sample:
+            grid = sample.grids[sample.annotations["organs"].grid_id]
+            assert grid.grid_id == "seg"
+            assert list(grid.spacing) == [2.5, 0.8, 0.8]
+            assert list(grid.origin) == [-4.0, -6.0, -6.0]
+            assert sorted(sample.grids) == ["ct", "seg"]
 
     def test_a_missing_extension_is_added(self, tiny_medh5, tmp_path):
         written = write_sample(

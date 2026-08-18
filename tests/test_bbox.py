@@ -13,9 +13,9 @@ from typing import Any
 import medh5
 import numpy as np
 import pytest
+from medh5.geometry.affine import box_to_slices
 
 from napari_medh5._bbox import (
-    EDGE_TO_CENTRE,
     _cuboid_wires,
     _rectangle_in_plane,
     boxes_to_shapes,
@@ -50,8 +50,16 @@ class TestRead:
         assert list(features["class_id"]) == [1, 2]
         assert features["depth_axis"][0] == 0
 
-    def test_S8_1_corners_shift_by_half_a_voxel_into_napari(self, tiny_medh5):
-        """[1.5, 4.5] at voxel edges is [2.0, 5.0] at voxel centres."""
+    def test_S8_1_corners_are_already_in_napari_coordinates(self, tiny_medh5):
+        """medh5 box edges and napari Shapes are the same continuous index space.
+
+        `[a, b]` is the slice `a+0.5 : b+0.5`, so `[1.5, 4.5]` encloses voxel
+        centres 2, 3, 4 --- and napari draws voxel `k` over `[k-0.5, k+0.5]`,
+        so those same three voxels occupy `[1.5, 4.5]` on screen.  Shifting by
+        half a voxel put every rectangle, and the plane it is drawn on, off the
+        image it describes; the inverse shift on write hid that from the
+        round trip.
+        """
         sample, annotation = _boxes_annotation(tiny_medh5)
         try:
             stored = np.asarray(annotation.boxes)
@@ -62,9 +70,11 @@ class TestRead:
             sample.close()
         features = layers[0][1]["features"]
         assert stored[0][0].tolist() == [1.5, 4.5]
-        assert features["depth_lo"][0] == pytest.approx(2.0)
-        assert features["depth_hi"][0] == pytest.approx(5.0)
-        assert EDGE_TO_CENTRE == 0.5
+        assert features["depth_lo"][0] == pytest.approx(1.5)
+        assert features["depth_hi"][0] == pytest.approx(4.5)
+        # The plane the rectangle is drawn on is the centre of voxels 2, 3, 4.
+        assert np.asarray(layers[0][0][0])[0, 0] == pytest.approx(3.0)
+        assert box_to_slices(stored[0])[0] == slice(2, 5)
 
     def test_an_empty_box_annotation_yields_no_layers(self, tmp_path):
         class _Empty:
@@ -170,7 +180,7 @@ class TestWrite:
             [rect], "rectangle", features, ndim=3
         )
         assert boxes is not None
-        assert boxes[0][0].tolist() == [1.5, 5.5]  # centres -> edges
+        assert boxes[0][0].tolist() == [2.0, 6.0]  # the same space, unchanged
         assert class_ids == [1]
         assert scores is not None and scores[0] == 0.5
         assert instances is None  # -1 means "not carried"
@@ -225,4 +235,4 @@ class TestRoundTrip:
         )
         boxes, *_ = shapes_to_boxes([rect], "rectangle", None, ndim=3)
         assert boxes is not None
-        assert boxes[0][1].tolist() == [0.75, 5.25]
+        assert boxes[0][1].tolist() == [1.25, 5.75]

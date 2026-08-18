@@ -29,8 +29,16 @@ from ._types import LayerDataTuple
 
 _SHAPE_TYPES = ("rectangle", "line")
 
-EDGE_TO_CENTRE = 0.5
-"""medh5 stores box corners at voxel edges; napari draws at voxel centres."""
+# medh5 box edges and napari Shapes coordinates are the *same* continuous
+# index space, so the conversion between them is the identity and there is no
+# constant here on purpose.
+#
+# `[a, b]` is the slice `a+0.5 : b+0.5` (§8.1), so a stored `[1.5, 4.5]`
+# encloses voxel centres 2, 3, 4.  napari draws voxel `k` centred at `k`,
+# occupying `[k-0.5, k+0.5]`, so those same three voxels occupy `[1.5, 4.5]`
+# on screen.  Shifting by half a voxel moved every rectangle --- and the depth
+# plane it is drawn on --- off the image it describes, and the inverse shift
+# on write hid it from every round-trip test.
 
 
 def _depth_axis(box: npt.NDArray[Any]) -> int:
@@ -97,9 +105,6 @@ def boxes_to_shapes(
     boxes = np.asarray(annotation.boxes, dtype=np.float64)
     if boxes.size == 0:
         return []
-    # Edges -> centres.  Do it once, here, so every downstream coordinate in
-    # this module is in napari's convention and nothing has to remember.
-    boxes = boxes + EDGE_TO_CENTRE
     count, ndim = boxes.shape[0], boxes.shape[1]
 
     class_ids = [int(c) for c in np.asarray(annotation.class_ids).ravel()]
@@ -225,7 +230,7 @@ def shapes_to_boxes(
     # Centres -> edges.  1.0 boxes are float at voxel edges, so nothing is
     # rounded here: a box drawn between two voxels stays between them, instead
     # of snapping to a voxel and moving the annotation.
-    out = np.stack(boxes, axis=0) - EDGE_TO_CENTRE
+    out = np.stack(boxes, axis=0)
 
     class_ids = _collect(features, "class_id", used, int)
     scores = _collect(features, "score", used, float)
@@ -267,4 +272,4 @@ def _collect(
     return None if np.all(array < 0) else array
 
 
-__all__ = ["EDGE_TO_CENTRE", "boxes_to_shapes", "shapes_to_boxes"]
+__all__ = ["boxes_to_shapes", "shapes_to_boxes"]
