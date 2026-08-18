@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-medh5"
-version = "0.1.0"
+version = "0.2.0"
 description = "napari plugin for viewing, annotating, and reviewing .medh5 medical-imaging samples."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,7 +35,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "medh5>=0.6.0",
+  "medh5>=1.0.0,<2",
   "napari>=0.5",
   "dask>=2024.1",
   "h5py>=3.10",

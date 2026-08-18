@@ -1,43 +1,59 @@
-"""Translate between medh5 ``(n, ndim, 2)`` bbox arrays and napari Shapes.
+"""Translate between medh5 boxes and napari Shapes layers.
 
-The round-trip strategy:
+**The half voxel is the whole problem.**  A medh5 box is ``float32`` at voxel
+*edges*: ``[a, b]`` covers the numpy slice ``a+0.5 : b+0.5`` (spec §8.1).  A
+napari rectangle is drawn at voxel *centres*, because that is where the pixels
+are.  So every corner shifts by half a voxel on the way in and back on the way
+out, and a round trip that forgets it moves every box by half a voxel per
+save --- the classic silent drift.
 
-- For rendering, each bbox is projected onto its "depth" axis (the axis with
-  the smallest extent — usually Z for axial CT).  A single rectangle is drawn
-  on the centre slice of that axis.  If any box spans more than one voxel
-  along the depth axis, a second Shapes layer with 12 line segments per box
-  renders the full 3D wireframe.
-- For saving, the rectangles layer is authoritative.  Each rectangle's depth
-  extent is taken from the ``features["depth"]`` column (populated on read,
-  editable through napari's shape features).
+napari has no native 3-D box, so:
+
+* **Read** --- each box is projected onto its shallowest axis and drawn as a
+  rectangle on that axis's centre slice.  The full extent survives in
+  ``features["depth_axis"|"depth_lo"|"depth_hi"]``.  A box deeper than one
+  voxel also gets a 12-segment wireframe in a companion layer.
+* **Write** --- the rectangle layer is authoritative and the wireframe is
+  ignored.  Depth comes from the feature columns, never from the drawn
+  rectangle.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import numpy as np
-from medh5 import validate_bboxes
+import numpy.typing as npt
 
 from ._types import LayerDataTuple
 
 _SHAPE_TYPES = ("rectangle", "line")
 
+# medh5 box edges and napari Shapes coordinates are the *same* continuous
+# index space, so the conversion between them is the identity and there is no
+# constant here on purpose.
+#
+# `[a, b]` is the slice `a+0.5 : b+0.5` (§8.1), so a stored `[1.5, 4.5]`
+# encloses voxel centres 2, 3, 4.  napari draws voxel `k` centred at `k`,
+# occupying `[k-0.5, k+0.5]`, so those same three voxels occupy `[1.5, 4.5]`
+# on screen.  Shifting by half a voxel moved every rectangle --- and the depth
+# plane it is drawn on --- off the image it describes, and the inverse shift
+# on write hid it from every round-trip test.
 
-def _depth_axis(box: np.ndarray) -> int:
+
+def _depth_axis(box: npt.NDArray[Any]) -> int:
     extents = box[:, 1] - box[:, 0]
     return int(np.argmin(extents))
 
 
 def _rectangle_in_plane(
-    box: np.ndarray, ndim: int, depth_axis: int, depth_value: float
-) -> np.ndarray:
-    """Return a ``(4, ndim)`` rectangle in napari coord order."""
+    box: npt.NDArray[Any], ndim: int, depth_axis: int, depth_value: float
+) -> npt.NDArray[Any]:
+    """A ``(4, ndim)`` rectangle in napari coordinate order."""
     corners = np.zeros((4, ndim), dtype=np.float64)
     plane_axes = [a for a in range(ndim) if a != depth_axis]
     if len(plane_axes) < 2:
-        raise ValueError("bbox must be at least 2D")
+        raise ValueError("a box must be at least 2-D to draw")
     a0, a1 = plane_axes[0], plane_axes[1]
     lo0, hi0 = float(box[a0, 0]), float(box[a0, 1])
     lo1, hi1 = float(box[a1, 0]), float(box[a1, 1])
@@ -45,13 +61,13 @@ def _rectangle_in_plane(
     corners[1, a0], corners[1, a1] = hi0, lo1
     corners[2, a0], corners[2, a1] = hi0, hi1
     corners[3, a0], corners[3, a1] = lo0, hi1
-    for c in corners:
-        c[depth_axis] = depth_value
+    for corner in corners:
+        corner[depth_axis] = depth_value
     return corners
 
 
-def _cuboid_wires(box: np.ndarray, ndim: int) -> list[np.ndarray]:
-    """Return 12 line segments (each as a ``(2, ndim)`` array) around a 3D box."""
+def _cuboid_wires(box: npt.NDArray[Any], ndim: int) -> list[npt.NDArray[Any]]:
+    """Twelve ``(2, ndim)`` line segments around a 3-D box."""
     if ndim != 3:
         return []
     lo = box[:, 0].astype(np.float64)
@@ -69,204 +85,191 @@ def _cuboid_wires(box: np.ndarray, ndim: int) -> list[np.ndarray]:
         ]
     )
     edges = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-    ]
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]  # fmt: skip
     return [np.stack([pts[a], pts[b]]) for a, b in edges]
 
 
-def arrays_to_shapes(
+def boxes_to_shapes(
+    annotation: Any,
     *,
-    bboxes: np.ndarray | None,
-    scores: np.ndarray | None,
-    labels: list[str] | None,
-    spatial_kwargs: dict[str, Any],
-    sample_shape: list[int],
+    names: dict[int, str],
+    layer_kwargs: dict[str, Any],
     path: str,
     stem: str,
+    suffix: str = "",
 ) -> list[LayerDataTuple]:
-    """Build one or two Shapes layers from a ``(n, ndim, 2)`` bbox array."""
-    if bboxes is None or len(bboxes) == 0:
+    """Build one or two Shapes layers from a `boxes` annotation."""
+    boxes = np.asarray(annotation.boxes, dtype=np.float64)
+    if boxes.size == 0:
         return []
-    bboxes = np.asarray(bboxes, dtype=np.float64)
-    n = bboxes.shape[0]
-    ndim = bboxes.shape[1]
+    count, ndim = boxes.shape[0], boxes.shape[1]
 
-    rectangles: list[np.ndarray] = []
-    rect_features = {
-        "depth_axis": np.zeros(n, dtype=np.int64),
-        "depth_lo": np.zeros(n, dtype=np.float64),
-        "depth_hi": np.zeros(n, dtype=np.float64),
-        "label": np.asarray(labels or [""] * n, dtype=object),
+    class_ids = [int(c) for c in np.asarray(annotation.class_ids).ravel()]
+    scores = getattr(annotation, "scores", None)
+    instance_ids = getattr(annotation, "instance_ids", None)
+
+    features: dict[str, Any] = {
+        "depth_axis": np.zeros(count, dtype=np.int64),
+        "depth_lo": np.zeros(count, dtype=np.float64),
+        "depth_hi": np.zeros(count, dtype=np.float64),
+        "class_id": np.asarray(class_ids, dtype=np.int64),
+        "label": np.asarray([names.get(c, str(c)) for c in class_ids], dtype=object),
         "score": np.asarray(
-            scores if scores is not None else [np.nan] * n, dtype=np.float64
+            scores if scores is not None else [np.nan] * count, dtype=np.float64
+        ),
+        "instance_id": np.asarray(
+            instance_ids if instance_ids is not None else [-1] * count, dtype=np.int64
         ),
     }
-    wire_segments: list[np.ndarray] = []
-    needs_wire = False
 
-    for i, box in enumerate(bboxes):
+    rectangles: list[npt.NDArray[Any]] = []
+    wires: list[npt.NDArray[Any]] = []
+    needs_wire = False
+    for index, box in enumerate(boxes):
         axis = _depth_axis(box)
         lo, hi = float(box[axis, 0]), float(box[axis, 1])
-        centre = 0.5 * (lo + hi)
-        rectangles.append(_rectangle_in_plane(box, ndim, axis, centre))
-        rect_features["depth_axis"][i] = axis
-        rect_features["depth_lo"][i] = lo
-        rect_features["depth_hi"][i] = hi
+        rectangles.append(_rectangle_in_plane(box, ndim, axis, 0.5 * (lo + hi)))
+        features["depth_axis"][index] = axis
+        features["depth_lo"][index] = lo
+        features["depth_hi"][index] = hi
         if hi - lo > 1:
             needs_wire = True
-            wire_segments.extend(_cuboid_wires(box, ndim))
+            wires.extend(_cuboid_wires(box, ndim))
 
     rect_kwargs: dict[str, Any] = {
-        "name": f"{stem}:bboxes",
-        "shape_type": ["rectangle"] * n,
-        "features": rect_features,
+        "name": f"{stem}:{annotation.ann_id}{suffix}",
+        "shape_type": ["rectangle"] * count,
+        "features": features,
         "edge_color": "yellow",
         "face_color": "transparent",
         "edge_width": 2,
+        "text": {"string": "{label}", "color": "yellow", "size": 10},
         "metadata": {
             "medh5_path": path,
             "medh5_role": "bbox_rect",
-            "sample_shape": list(sample_shape),
+            "medh5_name": annotation.ann_id,
+            "medh5_grid": annotation.grid_id,
+            "medh5_classes": dict(names),
+            "sample_shape": [int(s) for s in annotation.grid.spatial_shape],
         },
-        **spatial_kwargs,
+        **layer_kwargs,
     }
-    if labels is not None:
-        rect_kwargs["text"] = {"string": "{label}", "color": "yellow", "size": 10}
-
     layers: list[LayerDataTuple] = [(rectangles, rect_kwargs, "shapes")]
 
-    if needs_wire and wire_segments:
-        wire_kwargs: dict[str, Any] = {
-            "name": f"{stem}:bboxes:wire",
-            "shape_type": ["line"] * len(wire_segments),
-            "edge_color": "yellow",
-            "edge_width": 1,
-            "opacity": 0.5,
-            "metadata": {
-                "medh5_path": path,
-                "medh5_role": "bbox_wire",
-            },
-            **spatial_kwargs,
-        }
-        layers.append((wire_segments, wire_kwargs, "shapes"))
-
+    if needs_wire and wires:
+        layers.append(
+            (
+                wires,
+                {
+                    "name": f"{stem}:{annotation.ann_id}:wire{suffix}",
+                    "shape_type": ["line"] * len(wires),
+                    "edge_color": "yellow",
+                    "edge_width": 1,
+                    "opacity": 0.5,
+                    "metadata": {
+                        "medh5_path": path,
+                        "medh5_role": "bbox_wire",
+                        "medh5_name": annotation.ann_id,
+                    },
+                    **layer_kwargs,
+                },
+                "shapes",
+            )
+        )
     return layers
 
 
-def shapes_to_arrays(
-    shapes_data: list[np.ndarray],
+def shapes_to_boxes(
+    shapes_data: list[npt.NDArray[Any]],
     shape_types: list[str] | str,
     features: dict[str, Any] | None,
     ndim: int,
-    sample_shape: list[int] | None,
-) -> tuple[np.ndarray | None, np.ndarray | None, list[str] | None]:
-    """Convert a napari Shapes ``rect`` layer back to ``(n, ndim, 2)`` bboxes.
+) -> tuple[
+    npt.NDArray[Any] | None, list[int] | None, npt.NDArray[Any] | None, list[int] | None
+]:
+    """Convert a rectangles layer back to medh5 boxes, class ids, scores, ids.
 
-    The wireframe companion layer is ignored — ``rect`` carries the full truth
-    through the ``depth_lo`` / ``depth_hi`` / ``depth_axis`` feature columns.
+    Returns coordinates at **voxel edges**, ready to write.  The wireframe
+    companion is ignored: the rectangle layer carries the depth extent in its
+    features, and the wires are a rendering of it.
     """
     if not shapes_data:
-        return None, None, None
+        return None, None, None, None
 
     if isinstance(shape_types, str):
         shape_types = [shape_types] * len(shapes_data)
 
-    boxes: list[np.ndarray] = []
-    used_indices: list[int] = []
-    for idx, (shape, stype) in enumerate(zip(shapes_data, shape_types, strict=False)):
-        if stype not in _SHAPE_TYPES:
+    boxes: list[npt.NDArray[Any]] = []
+    used: list[int] = []
+    for index, (shape, kind) in enumerate(zip(shapes_data, shape_types, strict=False)):
+        if kind not in _SHAPE_TYPES:
             continue
-        arr = np.asarray(shape, dtype=np.float64)
-        if arr.shape[0] < 2 or arr.shape[1] != ndim:
+        corners = np.asarray(shape, dtype=np.float64)
+        if corners.shape[0] < 2 or corners.shape[1] != ndim:
             continue
-        mins = arr.min(axis=0)
-        maxs = arr.max(axis=0)
-        box = np.stack([mins, maxs], axis=1)
+        box = np.stack([corners.min(axis=0), corners.max(axis=0)], axis=1)
 
-        if features is not None and "depth_axis" in features:
-            ax = _feature_value(features, "depth_axis", idx, default=None)
-            lo = _feature_value(features, "depth_lo", idx, default=None)
-            hi = _feature_value(features, "depth_hi", idx, default=None)
-            if ax is not None and lo is not None and hi is not None:
-                axi = int(ax)
-                if 0 <= axi < ndim:
-                    box[axi, 0] = float(lo)
-                    box[axi, 1] = float(hi)
+        axis = _feature_value(features, "depth_axis", index)
+        lo = _feature_value(features, "depth_lo", index)
+        hi = _feature_value(features, "depth_hi", index)
+        if axis is not None and lo is not None and hi is not None:
+            position = int(axis)
+            if 0 <= position < ndim:
+                box[position, 0] = float(lo)
+                box[position, 1] = float(hi)
 
         boxes.append(box)
-        used_indices.append(idx)
+        used.append(index)
 
     if not boxes:
-        return None, None, None
+        return None, None, None, None
 
-    # medh5 stores bboxes as integer voxel indices and ships a clamping
-    # helper (``validate_bboxes``) that bounds-checks every (lo, hi) pair
-    # against the sample shape and emits one issue per adjustment. Round
-    # napari's float coords before calling — the helper raises on float
-    # input.
-    bboxes = np.rint(np.stack(boxes, axis=0)).astype(np.int64)
-    if sample_shape is not None:
-        clamped, issues = validate_bboxes(bboxes, tuple(int(s) for s in sample_shape))
-        if issues:
-            details = "; ".join(
-                f"box {i}/axis {a}: {reason}" for (i, a, reason) in issues
-            )
-            warnings.warn(
-                f"Bbox edits clamped to sample bounds {list(sample_shape)}: {details}",
-                UserWarning,
-                stacklevel=2,
-            )
-        bboxes = clamped
-    scores = _collect_feature(features, "score", used_indices, dtype=float)
-    labels_raw = _collect_feature(features, "label", used_indices, dtype=object)
-    labels: list[str] | None = (
-        [str(v) for v in labels_raw] if labels_raw is not None else None
+    # Centres -> edges.  1.0 boxes are float at voxel edges, so nothing is
+    # rounded here: a box drawn between two voxels stays between them, instead
+    # of snapping to a voxel and moving the annotation.
+    out = np.stack(boxes, axis=0)
+
+    class_ids = _collect(features, "class_id", used, int)
+    scores = _collect(features, "score", used, float)
+    instances = _collect(features, "instance_id", used, int)
+    return (
+        out.astype(np.float32),
+        [int(c) for c in class_ids] if class_ids is not None else None,
+        scores,
+        [int(i) for i in instances] if instances is not None else None,
     )
-    return bboxes, scores, labels
 
 
-def _feature_value(
-    features: dict[str, Any] | None, key: str, idx: int, default: Any = None
-) -> Any:
+def _feature_value(features: dict[str, Any] | None, key: str, index: int) -> Any:
     if features is None or key not in features:
-        return default
-    col = features[key]
+        return None
     try:
-        value = col[idx]
+        value = features[key][index]
     except (IndexError, KeyError, TypeError):
-        return default
+        return None
     if isinstance(value, float) and np.isnan(value):
-        return default
+        return None
     return value
 
 
-def _collect_feature(
-    features: dict[str, Any] | None,
-    key: str,
-    indices: list[int],
-    dtype: Any,
-) -> np.ndarray | None:
+def _collect(
+    features: dict[str, Any] | None, key: str, indices: list[int], dtype: Any
+) -> npt.NDArray[Any] | None:
     if features is None or key not in features:
         return None
-    col = features[key]
+    column = features[key]
     try:
-        values = [col[i] for i in indices]
+        values = [column[i] for i in indices]
     except (IndexError, KeyError, TypeError):
         return None
     if dtype is float:
-        arr = np.asarray(values, dtype=np.float64)
-        if np.all(np.isnan(arr)):
-            return None
-        return arr
-    return np.asarray(values, dtype=dtype)
+        array = np.asarray(values, dtype=np.float64)
+        return None if np.all(np.isnan(array)) else array
+    array = np.asarray(values, dtype=np.int64)
+    return None if np.all(array < 0) else array
+
+
+__all__ = ["boxes_to_shapes", "shapes_to_boxes"]

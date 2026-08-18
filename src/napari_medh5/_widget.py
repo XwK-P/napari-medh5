@@ -1,17 +1,22 @@
-"""Dock widget: validation report, checksum verify, review status, metadata tree."""
+"""Dock widget: validation, integrity, per-annotation quality, and the document.
+
+The 0.x widget had one review status per *file*, because that is what the
+format could hold.  1.0 records quality **per annotation** (§11.2) with a
+provenance activity behind it, so the widget follows: pick an annotation,
+set its status, and the file records who said so and when --- rather than a
+single flag that cannot say which of three masks was reviewed.
+"""
 
 from __future__ import annotations
 
 import getpass
 import json
-from datetime import datetime, timezone
 from typing import Any
 
-from medh5 import MEDH5File, VerifyResult
-from medh5.review import ReviewStatus, get_review_status, set_review_status
+import medh5
+from medh5.validate import validate_file
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
-    QButtonGroup,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -20,7 +25,6 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -29,7 +33,15 @@ from qtpy.QtWidgets import (
 
 from napari_medh5._handles import REGISTRY, attach_viewer, rebind_viewer_layers
 
-_STATUSES = ("pending", "reviewed", "flagged", "rejected")
+QUALITY_STATUS = (
+    "draft",
+    "submitted",
+    "reviewed",
+    "approved",
+    "rejected",
+    "deprecated",
+)
+LEVELS = ("structural", "semantic", "integrity", "strict")
 
 
 class MEDH5Widget(QWidget):
@@ -47,10 +59,10 @@ class MEDH5Widget(QWidget):
         root.addWidget(_titled("Active sample", self._sample_picker))
 
         root.addWidget(self._build_validation_box())
-        root.addWidget(self._build_checksum_box())
-        root.addWidget(self._build_review_box())
-        root.addWidget(self._build_metadata_box())
-        root.addWidget(self._build_nnunet_box())
+        root.addWidget(self._build_integrity_box())
+        root.addWidget(self._build_quality_box())
+        root.addWidget(self._build_labels_box())
+        root.addWidget(self._build_document_box())
         root.addStretch(1)
 
         if napari_viewer is not None:
@@ -59,24 +71,22 @@ class MEDH5Widget(QWidget):
             napari_viewer.layers.events.removed.connect(self._refresh_samples)
             self._refresh_samples()
 
-    # ------------------------------------------------------------------
-    # Sample discovery & switching
-    # ------------------------------------------------------------------
+    # -- sample discovery --------------------------------------------------
 
     def _refresh_samples(self, event: Any = None) -> None:
         paths: list[str] = []
         if self._viewer is not None:
             for layer in self._viewer.layers:
                 meta = getattr(layer, "metadata", None) or {}
-                p = meta.get("medh5_path") if isinstance(meta, dict) else None
-                if isinstance(p, str) and p not in paths:
-                    paths.append(p)
-        prev = self._active_path
+                path = meta.get("medh5_path") if isinstance(meta, dict) else None
+                if isinstance(path, str) and path not in paths:
+                    paths.append(path)
+        previous = self._active_path
         self._sample_picker.blockSignals(True)
         self._sample_picker.clear()
         self._sample_picker.addItems(paths)
-        if prev in paths:
-            self._sample_picker.setCurrentText(prev)
+        if previous in paths:
+            self._sample_picker.setCurrentText(previous)
         self._sample_picker.blockSignals(False)
         current = self._sample_picker.currentText() or None
         if current != self._active_path:
@@ -88,14 +98,12 @@ class MEDH5Widget(QWidget):
 
     def _reload_all(self) -> None:
         self._refresh_validation()
-        self._refresh_checksum_label()
-        self._refresh_review()
-        self._refresh_metadata_tree()
-        self._refresh_nnunet_table()
+        self._refresh_integrity_label()
+        self._refresh_quality()
+        self._refresh_labels()
+        self._refresh_document()
 
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
+    # -- validation --------------------------------------------------------
 
     def _build_validation_box(self) -> QGroupBox:
         box = QGroupBox("Validation", self)
@@ -106,257 +114,273 @@ class MEDH5Widget(QWidget):
         )
         self._validation_tree.setRootIsDecorated(False)
         layout.addWidget(self._validation_tree)
-        btn_row = QHBoxLayout()
-        rerun = QPushButton("Re-run validation", box)
+
+        row = QHBoxLayout()
+        self._level_picker = QComboBox(box)
+        self._level_picker.addItems(LEVELS)
+        self._level_picker.setCurrentText("semantic")
+        self._level_picker.currentTextChanged.connect(self._refresh_validation)
+        row.addWidget(QLabel("Level", box))
+        row.addWidget(self._level_picker)
+        rerun = QPushButton("Re-run", box)
         rerun.clicked.connect(self._refresh_validation)
-        btn_row.addWidget(rerun)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
+        row.addWidget(rerun)
+        row.addStretch(1)
+        layout.addLayout(row)
         return box
 
-    def _refresh_validation(self) -> None:
+    def _refresh_validation(self, *_: Any) -> None:
         self._validation_tree.clear()
         if not self._active_path:
             return
         try:
-            report = MEDH5File.validate(self._active_path)
-        except Exception as exc:  # noqa: BLE001 — surface anything to the user
-            item = QTreeWidgetItem(["error", "validate_failed", "", str(exc)])
-            self._validation_tree.addTopLevelItem(item)
+            report = validate_file(
+                self._active_path, level=self._level_picker.currentText()
+            )
+        except Exception as exc:  # noqa: BLE001 - surface anything to the user
+            self._validation_tree.addTopLevelItem(
+                QTreeWidgetItem(["error", "validate_failed", "", str(exc)])
+            )
             return
-        for issue in report.errors:
-            item = QTreeWidgetItem(
-                ["error", issue.code, issue.location or "", issue.message]
+        for diagnostic in report.diagnostics:
+            self._validation_tree.addTopLevelItem(
+                QTreeWidgetItem(
+                    [
+                        diagnostic.severity,
+                        diagnostic.code,
+                        diagnostic.location or "",
+                        diagnostic.message,
+                    ]
+                )
             )
-            self._validation_tree.addTopLevelItem(item)
-        for issue in report.warnings:
-            item = QTreeWidgetItem(
-                ["warning", issue.code, issue.location or "", issue.message]
-            )
-            self._validation_tree.addTopLevelItem(item)
-        if not report.errors and not report.warnings:
+        if not report.diagnostics:
             self._validation_tree.addTopLevelItem(
                 QTreeWidgetItem(["ok", "", "", "No issues reported"])
             )
 
-    # ------------------------------------------------------------------
-    # Checksum
-    # ------------------------------------------------------------------
+    # -- integrity ---------------------------------------------------------
 
-    def _build_checksum_box(self) -> QGroupBox:
-        box = QGroupBox("Checksum", self)
+    def _build_integrity_box(self) -> QGroupBox:
+        box = QGroupBox("Integrity", self)
         layout = QVBoxLayout(box)
-        self._checksum_label = QLabel("—", box)
-        layout.addWidget(self._checksum_label)
-        btn = QPushButton("Verify checksum", box)
-        btn.clicked.connect(self._verify_checksum)
-        layout.addWidget(btn)
+        self._integrity_label = QLabel("—", box)
+        self._integrity_label.setWordWrap(True)
+        layout.addWidget(self._integrity_label)
+        button = QPushButton("Verify digests", box)
+        button.clicked.connect(self._verify)
+        layout.addWidget(button)
         return box
 
-    def _refresh_checksum_label(self) -> None:
-        self._checksum_label.setText("Not verified yet" if self._active_path else "—")
+    def _refresh_integrity_label(self) -> None:
+        self._integrity_label.setText("Not verified yet" if self._active_path else "—")
 
-    def _verify_checksum(self) -> None:
+    def _verify(self) -> None:
         if not self._active_path:
             return
         try:
-            result = MEDH5File.verify(self._active_path)
+            with medh5.open(self._active_path) as sample:
+                result = sample.verify()
+                content_id = sample.content_id
         except Exception as exc:  # noqa: BLE001
-            self._checksum_label.setText(f"Error: {exc}")
+            self._integrity_label.setText(f"Error: {exc}")
             return
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        # medh5 0.6.0 returns a tri-state ``VerifyResult`` so audit UIs
-        # can distinguish "no checksum was ever stored" from "verified
-        # good" — both used to render as a bare green tick.
-        if result is VerifyResult.OK:
-            text = f"OK @ {stamp}"
-        elif result is VerifyResult.MISSING:
-            text = f"No checksum stored @ {stamp}"
+        lines = [f"{len(result.checked)} object(s) checked"]
+        if result.mismatched:
+            lines.append(f"MISMATCH: {', '.join(result.mismatched)}")
+        if result.stale_index:
+            lines.append(
+                f"stale index: {', '.join(result.stale_index)} "
+                "(rebuild with `medh5 fix --rebuild-index`)"
+            )
+        # `None` is not "fine": it means the file declares no content_id, so
+        # nothing was compared.  Saying "OK" there would be a claim about a
+        # check that never ran.
+        if result.content_id_ok is None:
+            lines.append("no content_id declared — nothing to compare")
+        elif result.content_id_ok:
+            lines.append(f"content_id OK: {content_id}")
         else:
-            text = f"MISMATCH @ {stamp}"
-        self._checksum_label.setText(text)
+            lines.append("content_id does NOT match the file's contents")
+        self._integrity_label.setText("\n".join(lines))
 
-    # ------------------------------------------------------------------
-    # Review
-    # ------------------------------------------------------------------
+    # -- quality -----------------------------------------------------------
 
-    def _build_review_box(self) -> QGroupBox:
-        box = QGroupBox("Review", self)
+    def _build_quality_box(self) -> QGroupBox:
+        box = QGroupBox("Annotation quality", self)
         layout = QVBoxLayout(box)
-
-        self._status_group = QButtonGroup(box)
-        radio_row = QHBoxLayout()
-        self._status_buttons: dict[str, QRadioButton] = {}
-        for status in _STATUSES:
-            btn = QRadioButton(status, box)
-            self._status_group.addButton(btn)
-            self._status_buttons[status] = btn
-            radio_row.addWidget(btn)
-        layout.addLayout(radio_row)
 
         form = QFormLayout()
-        self._annotator_edit = QLineEdit(box)
-        self._annotator_edit.setText(getpass.getuser())
-        form.addRow("Annotator", self._annotator_edit)
+        self._annotation_picker = QComboBox(box)
+        self._annotation_picker.currentTextChanged.connect(self._on_annotation_changed)
+        form.addRow("Annotation", self._annotation_picker)
+        self._status_picker = QComboBox(box)
+        self._status_picker.addItems(QUALITY_STATUS)
+        form.addRow("Status", self._status_picker)
+        self._reviewer_edit = QLineEdit(box)
+        self._reviewer_edit.setText(getpass.getuser())
+        form.addRow("Reviewer", self._reviewer_edit)
         self._notes_edit = QPlainTextEdit(box)
-        self._notes_edit.setMaximumHeight(80)
-        form.addRow("Notes", self._notes_edit)
+        self._notes_edit.setMaximumHeight(60)
+        form.addRow("Note", self._notes_edit)
         layout.addLayout(form)
 
-        btn = QPushButton("Save review", box)
-        btn.clicked.connect(self._save_review)
-        layout.addWidget(btn)
+        button = QPushButton("Save quality record", box)
+        button.clicked.connect(self._save_quality)
+        layout.addWidget(button)
 
-        self._history_tree = QTreeWidget(box)
-        self._history_tree.setHeaderLabels(
-            ["Status", "Annotator", "Timestamp", "Notes"]
-        )
-        self._history_tree.setRootIsDecorated(False)
-        layout.addWidget(QLabel("History", box))
-        layout.addWidget(self._history_tree)
-
+        self._provenance_tree = QTreeWidget(box)
+        self._provenance_tree.setHeaderLabels(["Activity", "Agent", "Tool", "When"])
+        self._provenance_tree.setRootIsDecorated(False)
+        layout.addWidget(QLabel("Provenance", box))
+        layout.addWidget(self._provenance_tree)
         return box
 
-    def _refresh_review(self) -> None:
-        self._history_tree.clear()
-        for btn in self._status_buttons.values():
-            btn.setChecked(False)
-        self._notes_edit.clear()
+    def _refresh_quality(self) -> None:
+        self._annotation_picker.blockSignals(True)
+        self._annotation_picker.clear()
+        self._provenance_tree.clear()
         if not self._active_path:
+            self._annotation_picker.blockSignals(False)
             return
         try:
-            status = get_review_status(self._active_path)
+            with medh5.open(self._active_path) as sample:
+                self._annotation_picker.addItems(sorted(sample.annotations))
+                document = sample.document
+                agents = {a.id: a.name or a.id for a in document.provenance.agents}
+                for activity in document.provenance.activities:
+                    self._provenance_tree.addTopLevelItem(
+                        QTreeWidgetItem(
+                            [
+                                activity.type,
+                                agents.get(activity.agent or "", activity.agent or ""),
+                                str(activity.tool or ""),
+                                str(activity.ended or activity.started or ""),
+                            ]
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001
-            self._annotator_edit.setPlaceholderText(f"Error: {exc}")
-            return
-        self._populate_review(status)
+            self._notes_edit.setPlaceholderText(f"Error: {exc}")
+        finally:
+            self._annotation_picker.blockSignals(False)
+        self._on_annotation_changed(self._annotation_picker.currentText())
 
-    def _populate_review(self, status: ReviewStatus) -> None:
-        if status.status in self._status_buttons:
-            self._status_buttons[status.status].setChecked(True)
-        if status.annotator:
-            self._annotator_edit.setText(status.annotator)
-        if status.notes:
-            self._notes_edit.setPlainText(status.notes)
-        for entry in status.history or []:
-            self._history_tree.addTopLevelItem(
-                QTreeWidgetItem(
-                    [
-                        str(entry.get("status", "")),
-                        str(entry.get("annotator", "") or ""),
-                        str(entry.get("timestamp", "") or ""),
-                        str(entry.get("notes", "") or ""),
-                    ]
-                )
-            )
-
-    def _save_review(self) -> None:
-        if not self._active_path:
-            return
-        checked = self._status_group.checkedButton()
-        if checked is None:
-            return
-        status = checked.text()
-        # ``set_review_status`` opens the file in append mode; HDF5 forbids a
-        # second open while the registry still holds the read handle, so we
-        # drop first. We rely on medh5 0.6.0's ``on_reopened`` callback to
-        # rebind lazy layers on success, and an explicit ``finally`` rebind
-        # to recover from validation/IO errors that abort before the write.
-        REGISTRY.drop(self._active_path)
-        new_status: ReviewStatus | None = None
-        try:
-            new_status = set_review_status(
-                self._active_path,
-                status=status,
-                annotator=self._annotator_edit.text() or None,
-                notes=self._notes_edit.toPlainText() or None,
-                on_reopened=lambda p: rebind_viewer_layers(p, self._viewer),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._annotator_edit.setPlaceholderText(f"Error: {exc}")
-            rebind_viewer_layers(self._active_path, self._viewer)
-            return
-        # 0.6.0 returns the freshly persisted ReviewStatus, so we can refresh
-        # the UI without reopening the file.
-        self._history_tree.clear()
-        for btn in self._status_buttons.values():
-            btn.setChecked(False)
-        self._populate_review(new_status)
-
-    # ------------------------------------------------------------------
-    # Metadata tree
-    # ------------------------------------------------------------------
-
-    def _build_metadata_box(self) -> QGroupBox:
-        box = QGroupBox("Metadata", self)
-        layout = QVBoxLayout(box)
-        self._meta_tree = QTreeWidget(box)
-        self._meta_tree.setHeaderLabels(["Key", "Value"])
-        self._meta_tree.setAlternatingRowColors(True)
-        layout.addWidget(self._meta_tree)
-        return box
-
-    def _refresh_metadata_tree(self) -> None:
-        self._meta_tree.clear()
-        if not self._active_path:
+    def _on_annotation_changed(self, name: str) -> None:
+        if not name or not self._active_path:
             return
         try:
-            meta = MEDH5File.read_meta(self._active_path)
-        except Exception as exc:  # noqa: BLE001
-            self._meta_tree.addTopLevelItem(QTreeWidgetItem(["error", str(exc)]))
-            return
-        data: dict[str, Any] = {
-            "schema_version": meta.schema_version,
-            "image_names": meta.image_names,
-            "label": meta.label,
-            "label_name": meta.label_name,
-            "shape": meta.shape,
-            "has_seg": meta.has_seg,
-            "seg_names": meta.seg_names,
-            "has_bbox": meta.has_bbox,
-            "patch_size": meta.patch_size,
-            "spatial": {
-                "spacing": meta.spatial.spacing,
-                "origin": meta.spatial.origin,
-                "direction": meta.spatial.direction,
-                "axis_labels": meta.spatial.axis_labels,
-                "coord_system": meta.spatial.coord_system,
-            },
-            "extra": meta.extra or {},
-        }
-        for key, value in data.items():
-            self._meta_tree.addTopLevelItem(_tree_item(key, value))
-
-    # ------------------------------------------------------------------
-    # nnU-Net class surfacing
-    # ------------------------------------------------------------------
-
-    def _build_nnunet_box(self) -> QGroupBox:
-        box = QGroupBox("nnU-Net v2 classes", self)
-        layout = QVBoxLayout(box)
-        self._nnunet_tree = QTreeWidget(box)
-        self._nnunet_tree.setHeaderLabels(["Class name", "Value"])
-        self._nnunet_tree.setRootIsDecorated(False)
-        layout.addWidget(self._nnunet_tree)
-        return box
-
-    def _refresh_nnunet_table(self) -> None:
-        self._nnunet_tree.clear()
-        if not self._active_path:
-            return
-        try:
-            meta = MEDH5File.read_meta(self._active_path)
+            with medh5.open(self._active_path) as sample:
+                record = sample.document.quality.get(name)
         except Exception:  # noqa: BLE001
             return
-        extra = meta.extra or {}
-        nn = extra.get("nnunetv2") if isinstance(extra, dict) else None
-        if not isinstance(nn, dict):
+        if record is None:
+            self._status_picker.setCurrentText("draft")
+            self._notes_edit.clear()
             return
-        labels = nn.get("labels")
-        if not isinstance(labels, dict):
+        self._status_picker.setCurrentText(record.status)
+        notes = [i.note for i in record.issues if i.note]
+        self._notes_edit.setPlainText("\n".join(notes))
+
+    def _save_quality(self) -> None:
+        path = self._active_path
+        name = self._annotation_picker.currentText()
+        if not path or not name:
             return
-        for name, value in labels.items():
-            self._nnunet_tree.addTopLevelItem(QTreeWidgetItem([str(name), str(value)]))
+        reviewer = self._reviewer_edit.text().strip() or None
+        note = self._notes_edit.toPlainText().strip()
+
+        # `amend` replaces the file, so the read handle has to go first or
+        # every lazy layer keeps serving the pre-edit inode.
+        REGISTRY.drop(path)
+        try:
+            with medh5.amend(path) as writer:
+                agent = (
+                    writer.person(reviewer)
+                    if reviewer
+                    else writer.software("napari-medh5")
+                )
+                writer.activity(
+                    "review",
+                    agent=agent,
+                    tool="napari-medh5",
+                    outputs=[f"annotations/{name}"],
+                    params={"status": self._status_picker.currentText()},
+                )
+                writer.set_quality(
+                    name,
+                    status=self._status_picker.currentText(),
+                    reviewed_by=[agent.id],
+                    issues=(
+                        [{"code": "reviewer_note", "severity": "info", "note": note}]
+                        if note
+                        else []
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._notes_edit.setPlaceholderText(f"Error: {exc}")
+        finally:
+            rebind_viewer_layers(path, self._viewer)
+        self._refresh_quality()
+
+    # -- label set ---------------------------------------------------------
+
+    def _build_labels_box(self) -> QGroupBox:
+        box = QGroupBox("Label set", self)
+        layout = QVBoxLayout(box)
+        self._labels_tree = QTreeWidget(box)
+        self._labels_tree.setHeaderLabels(["id", "key", "name", "parents"])
+        self._labels_tree.setRootIsDecorated(False)
+        layout.addWidget(self._labels_tree)
+        return box
+
+    def _refresh_labels(self) -> None:
+        self._labels_tree.clear()
+        if not self._active_path:
+            return
+        try:
+            with medh5.open(self._active_path) as sample:
+                label_set = sample.label_set
+                if label_set is None:
+                    self._labels_tree.addTopLevelItem(
+                        QTreeWidgetItem(["", "", "no label set declared", ""])
+                    )
+                    return
+                for entry in label_set:
+                    self._labels_tree.addTopLevelItem(
+                        QTreeWidgetItem(
+                            [
+                                str(entry.id),
+                                entry.key,
+                                entry.name or "",
+                                ", ".join(str(p) for p in entry.parents),
+                            ]
+                        )
+                    )
+        except Exception:  # noqa: BLE001
+            return
+
+    # -- document ----------------------------------------------------------
+
+    def _build_document_box(self) -> QGroupBox:
+        box = QGroupBox("Document", self)
+        layout = QVBoxLayout(box)
+        self._document_tree = QTreeWidget(box)
+        self._document_tree.setHeaderLabels(["Key", "Value"])
+        self._document_tree.setAlternatingRowColors(True)
+        layout.addWidget(self._document_tree)
+        return box
+
+    def _refresh_document(self) -> None:
+        self._document_tree.clear()
+        if not self._active_path:
+            return
+        try:
+            with medh5.open(self._active_path) as sample:
+                data = sample.summary()
+        except Exception as exc:  # noqa: BLE001
+            self._document_tree.addTopLevelItem(QTreeWidgetItem(["error", str(exc)]))
+            return
+        for key, value in data.items():
+            self._document_tree.addTopLevelItem(_tree_item(key, value))
 
 
 def _titled(title: str, widget: QWidget) -> QWidget:
@@ -373,13 +397,13 @@ def _titled(title: str, widget: QWidget) -> QWidget:
 def _tree_item(key: str, value: Any) -> QTreeWidgetItem:
     if isinstance(value, dict):
         item = QTreeWidgetItem([str(key), ""])
-        for k, v in value.items():
-            item.addChild(_tree_item(k, v))
+        for child_key, child in value.items():
+            item.addChild(_tree_item(child_key, child))
         return item
     if isinstance(value, list) and value and isinstance(value[0], (list, dict)):
         item = QTreeWidgetItem([str(key), ""])
-        for i, v in enumerate(value):
-            item.addChild(_tree_item(f"[{i}]", v))
+        for index, child in enumerate(value):
+            item.addChild(_tree_item(f"[{index}]", child))
         return item
     if isinstance(value, (list, tuple)):
         return QTreeWidgetItem([str(key), json.dumps(list(value))])
