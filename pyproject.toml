@@ -35,7 +35,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "medh5>=1.0.0",
+  "medh5>=1.0.0,<2",
   "napari>=0.5",
   "dask>=2024.1",
   "h5py>=3.10",
