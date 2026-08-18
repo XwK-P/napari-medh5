@@ -139,21 +139,128 @@ RICH_KINDS = ("probmap", "instances")
 #: Encodings that are per-class masks, and so survive a merge unchanged.
 MASK_KINDS = ("labelmap", "layers", "bitmask")
 
+#: The reserved id napari shows an ignore region as.
+IGNORE_ID = 65535
 
-def _refuse_lossy(name: str, kind: str | None) -> None:
-    """Refuse only the edits nothing can reconstruct.
+
+@dataclass
+class _Source:
+    """What the file being written *from* says about the annotations on screen.
+
+    Read before the file is closed, because both write paths rewrite it.
+    """
+
+    kinds: dict[str, str] = field(default_factory=dict)
+    maps: dict[str, npt.NDArray[Any]] = field(default_factory=dict)
+    masks: dict[str, dict[int, npt.NDArray[Any]]] = field(default_factory=dict)
+    ignores: dict[str, npt.NDArray[Any]] = field(default_factory=dict)
+    #: Annotations whose ignore region the encoding will not hand back.
+    opaque: set[str] = field(default_factory=set)
+
+    def edited(self, name: str, current: npt.NDArray[Any]) -> bool:
+        stored = self.maps.get(name)
+        return stored is None or not np.array_equal(current, stored)
+
+
+def _capture(sample: Any, bundle: _Bundle, *, always: bool) -> _Source:
+    """The stored labelmaps, and the masks behind them where they are needed.
+
+    *always* for a full write, which reproduces every annotation; an amend only
+    needs the masks of the ones that changed, and they can be large.
+    """
+    out = _Source()
+    for name, annotation in sample.annotations.items():
+        if name not in bundle.labelmaps or not hasattr(annotation, "labelmap"):
+            continue
+        stored = np.asarray(
+            annotation.labelmap(priority=draw_priority(annotation)), dtype=LABEL_DTYPE
+        )
+        out.kinds[name] = str(annotation.kind)
+        out.maps[name] = stored
+        if annotation.has_ignore_region:
+            region = _source_ignore(annotation)
+            if region is None:
+                out.opaque.add(name)
+            else:
+                out.ignores[name] = region
+        current = np.asarray(bundle.labelmaps[name], dtype=LABEL_DTYPE)
+        if always or not np.array_equal(current, stored):
+            out.masks[name] = {
+                int(c): np.asarray(annotation.dense([int(c)])[0])
+                for c in annotation.class_ids
+            }
+    return out
+
+
+def _resolve(
+    source: _Source, name: str, current: npt.NDArray[Any], meta: dict[str, Any]
+) -> tuple[dict[int, npt.NDArray[Any]], npt.NDArray[Any] | None, str]:
+    """The masks, ignore region and encoding to write for one annotation.
+
+    Both write paths go through here.  Fixing the amend loop and leaving Save
+    As to rebuild everything from the collapsed labelmap was the same data loss
+    by a second route.
+    """
+    kind = source.kinds.get(name)
+    stored = source.maps.get(name)
+    masks = source.masks.get(name)
+    if stored is None or masks is None:
+        return _masks_from(current, meta), _ignore_of(current), "auto"
+    changed = current != stored
+    merged = _merged_masks(current, stored, masks, meta, changed)
+    # The stored region, not `stored == IGNORE_ID`: `labelmap()` does not
+    # surface the ignore id, so napari never showed the region and the
+    # displayed map cannot be its source.  A voxel *painted* 65535 in the
+    # viewer is an edit, and joins it.
+    ignore = source.ignores.get(name)
+    ignore = np.zeros(current.shape, dtype=bool) if ignore is None else ignore.copy()
+    ignore[changed] = current[changed] == IGNORE_ID
+    encoding = kind if kind in MASK_KINDS else "auto"
+    return merged, (ignore if bool(ignore.any()) else None), encoding
+
+
+def _ignore_of(current: npt.NDArray[Any]) -> npt.NDArray[Any] | None:
+    """An ignore region painted into a labelmap with no source to merge with."""
+    ignore = current == IGNORE_ID
+    return ignore if bool(ignore.any()) else None
+
+
+def _source_ignore(annotation: Any) -> npt.NDArray[Any] | None:
+    """The stored ignore region, where the encoding hands it back.
+
+    Only `labelmap` exposes `ignore_mask()`.  For the rest the region is real
+    --- `has_ignore_region` says so --- and there is no public way to read it as
+    a mask, which is why rewriting one is refused rather than attempted.
+    """
+    reader = getattr(annotation, "ignore_mask", None)
+    if not callable(reader):
+        return None
+    mask = np.asarray(reader(), dtype=bool)
+    return mask if bool(mask.any()) else None
+
+
+def _refuse_lossy(name: str, kind: str | None, opaque_ignore: bool = False) -> None:
+    """Refuse only what nothing can reconstruct.
 
     A labelmap holds one id per voxel, so it cannot carry a probability or an
     instance identity back at all --- there is no merge that recovers those,
     and the file being overwritten is the only copy.  Overlapping *classes* are
     a different case and are handled by :func:`_merged_masks`.
     """
+    if opaque_ignore:
+        raise ValueError(
+            f"annotation {name!r} marks an ignore region and its {kind!r} "
+            "encoding does not expose it as a mask, so rewriting the annotation "
+            "would drop it --- and napari never displayed it to begin with, so "
+            "nothing on screen could put it back. Edit it with a tool that can "
+            "write that encoding, or copy the file directly."
+        )
     if kind in RICH_KINDS:
         raise ValueError(
             f"annotation {name!r} is a {kind!r} annotation, and napari edits it "
             "as a labelmap of one id per voxel; saving would replace the "
             f"{kind} with a hard segmentation. Edit it with a tool that can "
-            "write that encoding, or save to a new file under a new name."
+            "write that encoding, or copy the file directly."
         )
 
 
@@ -162,6 +269,7 @@ def _merged_masks(
     stored: npt.NDArray[Any],
     masks: dict[int, npt.NDArray[Any]],
     meta: dict[str, Any],
+    changed: npt.NDArray[Any],
 ) -> dict[int, npt.NDArray[Any]]:
     """Take the edit where the labelmap changed; keep the file everywhere else.
 
@@ -170,12 +278,13 @@ def _merged_masks(
     therefore deleted every overlap in the file --- including all the ones the
     editor never went near.  Only the voxels that actually changed take their
     class from the viewer; the rest keep exactly what was stored, overlaps
-    intact.
+    intact.  The ignore region rides along the same way, in :func:`_resolve`:
+    it is not a class, so clearing every mask at an ignored voxel turned it
+    into background instead.
     """
-    changed = current != stored
     out = {int(c): np.asarray(m, dtype=bool).copy() for c, m in masks.items()}
     for value in np.unique(current[changed]) if changed.any() else ():
-        if int(value) not in (0, 65535):
+        if int(value) not in (0, IGNORE_ID):
             out.setdefault(int(value), np.zeros(current.shape, dtype=bool))
     for class_id in [int(c) for c in meta.get("medh5_annotated") or ()]:
         out.setdefault(class_id, np.zeros(current.shape, dtype=bool))
@@ -201,32 +310,7 @@ def _amend(dest: Path, bundle: _Bundle) -> None:
         image_grids = {k: v.grid_id for k, v in sample.images.items()}
         ann_timepoints = {k: list(v.timepoints) for k, v in sample.annotations.items()}
         existing = set(sample.annotations)
-        source_kinds = {k: v.kind for k, v in sample.annotations.items()}
-        # What the reader put on screen, recomputed the same way, so an
-        # annotation nobody touched compares equal and is left alone.
-        source_maps = {
-            name: np.asarray(
-                annotation.labelmap(priority=draw_priority(annotation)),
-                dtype=LABEL_DTYPE,
-            )
-            for name, annotation in sample.annotations.items()
-            if hasattr(annotation, "labelmap")
-        }
-        # Per-class masks, captured only for the annotations that actually
-        # changed, since the sample is closed before `amend` reopens the file.
-        source_masks = {
-            name: {
-                int(c): np.asarray(annotation.dense([int(c)])[0])
-                for c in annotation.class_ids
-            }
-            for name, annotation in sample.annotations.items()
-            if name in source_maps
-            and name in bundle.labelmaps
-            and not np.array_equal(
-                np.asarray(bundle.labelmaps[name], dtype=LABEL_DTYPE),
-                source_maps[name],
-            )
-        }
+        src = _capture(sample, bundle, always=False)
 
     if source_images != set(bundle.images):
         raise ValueError(
@@ -240,41 +324,39 @@ def _amend(dest: Path, bundle: _Bundle) -> None:
                 f"{source_shapes[name]}; use Save As to write a new file"
             )
 
+    # Before the handle is dropped: a refusal after that point leaves every
+    # layer backed by a closed file, and the user asked for a save, not a
+    # broken viewer.
+    for name, labelmap in bundle.labelmaps.items():
+        if src.edited(name, np.asarray(labelmap, dtype=LABEL_DTYPE)):
+            _refuse_lossy(name, src.kinds.get(name), name in src.opaque)
+
     REGISTRY.drop(dest)
     with medh5.amend(dest) as writer:
         agent = writer.software(AGENT, _version())
         activity = writer.activity("annotate", agent=agent, tool="napari")
 
         for name, labelmap in bundle.labelmaps.items():
-            meta = bundle.seg_meta[name]
             current = np.asarray(labelmap, dtype=LABEL_DTYPE)
-            source = source_maps.get(name)
-            if source is not None and np.array_equal(current, source):
+            if not src.edited(name, current):
                 # Untouched.  `amend` is copy-on-write and carries it through
                 # exactly as it was --- encoding, overlaps and all.  Re-encoding
                 # it from what the viewer displayed is how merely *saving* used
                 # to delete every voxel where two classes overlapped.
                 continue
-            kind = source_kinds.get(name)
-            _refuse_lossy(name, kind)
+            meta = bundle.seg_meta[name]
             grid = ann_grids.get(name) or meta.get("medh5_grid")
             if grid is None:
                 grid = next(iter(image_grids.values()))
-            masks = (
-                _merged_masks(current, source, source_masks[name], meta)
-                if source is not None and name in source_masks
-                else _masks_from(labelmap, meta)
-            )
+            masks, ignore, encoding = _resolve(src, name, current, meta)
             if name in existing:
                 writer.remove_annotation(name)
             writer.add_segmentation(
                 name,
                 grid=grid,
                 masks=masks,
-                # Keep the encoding the file chose.  Re-selecting would quietly
-                # demote a `layers` annotation to `labelmap` the first time its
-                # overlaps happened to fall outside the edit.
-                encoding=kind if kind in MASK_KINDS else "auto",
+                ignore=ignore,
+                encoding=encoding,
                 annotated_classes=_annotated(meta, masks),
                 timepoints=ann_timepoints.get(name) or None,
                 prov=activity,
@@ -327,10 +409,15 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
     source = bundle.source_path
     document = None
     grids: dict[str, Any] = {}
+    src = _Source()
     if source and Path(source).exists():
         with medh5.open(source) as sample:
             document = sample.document
             grids = {k: v for k, v in sample.grids.items()}
+            # Save As reproduces every annotation, so it needs every mask.
+            src = _capture(sample, bundle, always=True)
+    for name in bundle.labelmaps:
+        _refuse_lossy(name, src.kinds.get(name), name in src.opaque)
 
     first = next(iter(bundle.images.values()))
     with medh5.create(
@@ -369,11 +456,14 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
 
         for name, labelmap in bundle.labelmaps.items():
             meta = bundle.seg_meta[name]
-            masks = _masks_from(labelmap, meta)
+            current = np.asarray(labelmap, dtype=LABEL_DTYPE)
+            masks, ignore, encoding = _resolve(src, name, current, meta)
             writer.add_segmentation(
                 name,
                 grid=_grid_for(meta, written_grids, declared_grids),
                 masks=masks,
+                ignore=ignore,
+                encoding=encoding,
                 annotated_classes=_annotated(meta, masks),
                 prov=activity,
             )

@@ -82,7 +82,13 @@ class TestMasksFromLabelmap:
         assert _masks_from(labelmap, {}) == {}
 
 
-def _overlapping(tmp_path: Path) -> Path:
+def _overlapping(
+    tmp_path: Path,
+    *,
+    encoding: str = "layers",
+    classes: tuple[int, ...] = (1, 3),
+    ignore: bool = False,
+) -> Path:
     """A sample whose lesion sits inside its liver, in an encoding that allows it."""
     from medh5.labels.labelset import LabelClass, LabelSet
 
@@ -91,7 +97,10 @@ def _overlapping(tmp_path: Path) -> Path:
     liver[2:6, 2:10, 2:10] = True
     lesion = np.zeros(shape, dtype=bool)
     lesion[3:5, 4:7, 4:7] = True
-    path = tmp_path / "overlap.medh5"
+    unexamined = np.zeros(shape, dtype=bool)
+    unexamined[7, 12:15, 12:15] = True
+    masks = {1: liver, 3: lesion}
+    path = tmp_path / f"overlap-{encoding}-{ignore}.medh5"
     with medh5.create(path, sample_id="s", subject_id="subj", codec="portable") as w:
         w.add_grid("g", shape=shape, spacing=(1.0, 1.0, 1.0))
         w.add_image("CT", np.zeros(shape, dtype=np.int16), grid="g", modality="CT")
@@ -108,9 +117,10 @@ def _overlapping(tmp_path: Path) -> Path:
         w.add_segmentation(
             "organs",
             grid="g",
-            masks={1: liver, 3: lesion},
-            encoding="layers",
-            annotated_classes=[1, 3],
+            masks={c: masks[c] for c in classes},
+            encoding=encoding,
+            annotated_classes=list(classes),
+            ignore=unexamined if ignore else None,
         )
     return path
 
@@ -170,6 +180,51 @@ class TestAmend:
         assert (kind, overlap, liver) == ("layers", 18, 257), "overlap kept, edit added"
         with medh5.open(path) as sample:
             assert sample.annotations["organs"].contains(1, (0, 0, 0))
+
+    def test_S6_4_an_ignore_region_survives_an_edit(self, tmp_path):
+        """An ignore region is not a class, and clearing it makes it background.
+
+        `_merged_masks` writes a class per voxel, so an ignored voxel came back
+        as `0` --- "examined and empty" instead of "not examined". The region
+        is merged separately, from the annotation rather than from the
+        labelmap, because `labelmap()` never surfaces the ignore id and napari
+        therefore never displayed it.
+        """
+        path = _overlapping(tmp_path, encoding="labelmap", classes=(1,), ignore=True)
+        with medh5.open(path) as sample:
+            assert sample.annotations["organs"].has_ignore_region
+
+        layers = materialise(read_layers(path))
+        for data, kwargs, _kind in layers:
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                data[0, 0, 0] = 1
+        write_sample(str(path), layers)
+
+        with medh5.open(path) as sample:
+            annotation = sample.annotations["organs"]
+            assert annotation.has_ignore_region, "the region outlived the edit"
+            assert annotation.contains(1, (0, 0, 0))
+
+    def test_S6_4_an_unreadable_ignore_region_is_refused(self, tmp_path):
+        """`ignore_mask()` is a `labelmap` accessor; the others do not expose one.
+
+        Rewriting such an annotation would drop the region, and nothing on
+        screen could put it back --- so the save is refused and the file is left
+        exactly as it was.
+        """
+        path = _overlapping(tmp_path, encoding="layers", ignore=True)
+        before = _overlap_state(path)
+
+        layers = materialise(read_layers(path))
+        for data, kwargs, _kind in layers:
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                data[0, 0, 0] = 1
+        with pytest.raises(ValueError, match="ignore region"):
+            write_sample(str(path), layers)
+
+        assert _overlap_state(path) == before
+        with medh5.open(path) as sample:
+            assert sample.annotations["organs"].has_ignore_region
 
     def test_everything_else_survives_the_amend(self, tiny_medh5):
         with medh5.open(tiny_medh5) as sample:
@@ -273,6 +328,35 @@ class TestSaveAs:
             assert list(grid.spacing) == [2.5, 0.8, 0.8]
             assert list(grid.origin) == [-4.0, -6.0, -6.0]
             assert sorted(sample.grids) == ["ct", "seg"]
+
+    def test_S7_save_as_preserves_overlaps_too(self, tmp_path):
+        """The amend fix left Save As rebuilding from the collapsed labelmap.
+
+        Same data loss, second route: a `layers` annotation copied to a new
+        path came out `labelmap` with every overlap gone.  Both paths resolve
+        their masks through one function now.
+        """
+        source = _overlapping(tmp_path)
+        assert _overlap_state(source) == ("layers", 18, 256)
+
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(source)))
+
+        assert _overlap_state(dest) == ("layers", 18, 256)
+
+    def test_S7_save_as_carries_an_edit_without_flattening_the_rest(self, tmp_path):
+        source = _overlapping(tmp_path)
+        layers = materialise(read_layers(source))
+        for data, kwargs, _kind in layers:
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                data[0, 0, 0] = 1
+
+        dest = tmp_path / "edited.medh5"
+        write_sample(str(dest), layers)
+
+        assert _overlap_state(dest) == ("layers", 18, 257)
+        with medh5.open(dest) as sample:
+            assert sample.annotations["organs"].contains(1, (0, 0, 0))
 
     def test_a_missing_extension_is_added(self, tiny_medh5, tmp_path):
         written = write_sample(
