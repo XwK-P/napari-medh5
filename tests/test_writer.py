@@ -324,6 +324,92 @@ class TestAmend:
         assert not validate_file(tiny_medh5).errors
 
 
+class TestDeletedLayers:
+    """Removing a layer and saving in place.
+
+    `amend` is copy-on-write, so anything not rewritten is carried through
+    untouched.  That is what protects an unedited annotation, and it protected
+    a deleted one too.
+    """
+
+    def _without(self, source, role, name=None):
+        out = []
+        for data, kwargs, kind in materialise(read_layers(source)):
+            meta = kwargs["metadata"]
+            if meta.get("medh5_role") == role and (
+                name is None or meta.get("medh5_name") == name
+            ):
+                continue
+            out.append((data, kwargs, kind))
+        return out
+
+    def test_deleting_a_labels_layer_removes_the_annotation(self, tiny_medh5):
+        write_sample(str(tiny_medh5), self._without(tiny_medh5, "seg"))
+        REGISTRY.close_all()
+        with medh5.open(tiny_medh5) as sample:
+            assert "seg" not in sample.annotations
+            assert "boxes" in sample.annotations  # still on screen
+
+    def test_deleting_a_shapes_layer_removes_the_annotation(self, tiny_medh5):
+        """The boxes loop had the same hole: emptying a Shapes layer worked,
+        because `shapes_to_boxes` returns `None`, but deleting the whole layer
+        never visited it."""
+        layers = [
+            one
+            for one in materialise(read_layers(tiny_medh5))
+            if not str(one[1]["metadata"].get("medh5_role", "")).startswith("bbox")
+        ]
+        write_sample(str(tiny_medh5), layers)
+        REGISTRY.close_all()
+        with medh5.open(tiny_medh5) as sample:
+            assert "boxes" not in sample.annotations
+            assert "seg" in sample.annotations
+
+    def test_an_annotation_that_was_never_loaded_is_never_deleted(self, tiny_medh5):
+        """The dangerous version of this fix.
+
+        Reconciling against the *file's* annotations rather than the reader's
+        record deletes whatever the user did not have on screen. Layers built
+        by hand carry no record, so the fallback has to be to delete nothing.
+        """
+        layers = []
+        for data, kwargs, kind in materialise(read_layers(tiny_medh5)):
+            kwargs = dict(kwargs)
+            kwargs["metadata"] = {
+                k: v for k, v in kwargs["metadata"].items() if k != "medh5_opened"
+            }
+            layers.append((data, kwargs, kind))
+        layers = [
+            one for one in layers if one[1]["metadata"].get("medh5_role") != "seg"
+        ]
+
+        write_sample(str(tiny_medh5), layers)
+        REGISTRY.close_all()
+        with medh5.open(tiny_medh5) as sample:
+            assert "seg" in sample.annotations
+
+    def test_a_partial_load_cannot_delete_what_it_did_not_open(self, tiny_medh5):
+        """A record naming one annotation says nothing about the other."""
+        layers = []
+        for data, kwargs, kind in materialise(read_layers(tiny_medh5)):
+            if kwargs["metadata"].get("medh5_role") == "seg":
+                continue
+            kwargs = dict(kwargs)
+            kwargs["metadata"] = {**kwargs["metadata"], "medh5_opened": ["boxes"]}
+            layers.append((data, kwargs, kind))
+
+        write_sample(str(tiny_medh5), layers)
+        REGISTRY.close_all()
+        with medh5.open(tiny_medh5) as sample:
+            assert "seg" in sample.annotations
+
+    def test_keeping_every_layer_deletes_nothing(self, tiny_medh5):
+        write_sample(str(tiny_medh5), materialise(read_layers(tiny_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(tiny_medh5) as sample:
+            assert set(sample.annotations) == {"seg", "boxes"}
+
+
 class TestSaveAs:
     def test_it_writes_a_new_file(self, tiny_medh5, tmp_path):
         dest = tmp_path / "copy.medh5"
@@ -331,6 +417,66 @@ class TestSaveAs:
             str(dest)
         ]
         assert dest.exists()
+
+    def _cropped(self, source):
+        """Every image layer cropped, the way a napari crop leaves them."""
+        out = []
+        for data, kwargs, kind in materialise(read_layers(source)):
+            if kwargs["metadata"].get("medh5_role") != "image":
+                continue
+            out.append((np.asarray(data)[:, :8, :8], kwargs, kind))
+        return out
+
+    def test_S3_a_reshaped_layer_is_refused_rather_than_given_unit_spacing(
+        self, tiny_medh5, tmp_path
+    ):
+        """Geometry is never invented (§3), and a crop moves the origin.
+
+        The fallback for an unknown grid is unit spacing at the origin, which
+        is honest for a layer that never had geometry.  For a cropped one it
+        replaced a known spacing, direction, coordinate system and frame of
+        reference with defaults --- so the image opened cleanly, sat in the
+        wrong place, and nothing said anything had been lost.
+        """
+        dest = tmp_path / "cropped.medh5"
+        with pytest.raises(ValueError, match="no derivable geometry"):
+            write_sample(str(dest), self._cropped(tiny_medh5))
+        # A refused Save As must not leave a half-written file behind.
+        assert not dest.exists()
+
+    def test_S3_the_refusal_names_a_way_out_that_works(self, tiny_medh5, tmp_path):
+        """A message advertising an escape hatch has to be tested for one.
+
+        Clearing `medh5_grid` says the layer no longer claims the source
+        geometry, which makes unit spacing the honest answer rather than a
+        substitution for something known.
+        """
+        layers = []
+        for data, kwargs, kind in self._cropped(tiny_medh5):
+            kwargs = dict(kwargs)
+            kwargs["metadata"] = {
+                k: v for k, v in kwargs["metadata"].items() if k != "medh5_grid"
+            }
+            layers.append((data, kwargs, kind))
+
+        dest = tmp_path / "nogrid.medh5"
+        write_sample(str(dest), layers)
+        with medh5.open(dest) as sample:
+            grid = sample.grids[sample.images["CT"].grid_id]
+            assert grid.shape == (8, 8, 8)
+            assert grid.spacing == (1.0, 1.0, 1.0)
+
+    def test_S3_an_unchanged_shape_still_carries_the_geometry_across(
+        self, tiny_medh5, tmp_path
+    ):
+        """The refusal must not catch an ordinary Save As."""
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(tiny_medh5)))
+        with medh5.open(tiny_medh5) as before, medh5.open(dest) as after:
+            assert (
+                after.grids[after.images["CT"].grid_id].spacing
+                == before.grids[before.images["CT"].grid_id].spacing
+            )
 
     def test_S3_an_annotation_keeps_the_grid_it_was_stored_on(self, tmp_path):
         """A segmentation may sit on its own grid, at its own spacing.

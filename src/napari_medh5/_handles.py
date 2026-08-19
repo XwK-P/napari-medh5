@@ -116,6 +116,25 @@ def _resolved_layer_medh5_path(layer: Any) -> str | None:
     return str(Path(raw).resolve())
 
 
+def _bound_anywhere(key: str) -> bool:
+    """Whether any attached viewer still has a layer backed by *key*.
+
+    The registry is process-global and one handle serves every window, so the
+    question a removal has to answer is not "does *this* viewer still need the
+    file" but "does anyone".  Asking the narrower one closed the file under a
+    second viewer's lazy arrays, which then failed on their next slice request
+    in a window the user had not touched.
+    """
+    for viewer in list(_attached_viewers):
+        layers: Any = getattr(viewer, "layers", None)
+        if layers is None:
+            continue
+        for layer in list(layers):
+            if _resolved_layer_medh5_path(layer) == key:
+                return True
+    return False
+
+
 def attach_viewer(viewer: Any) -> None:
     """Hook *viewer* so removing the last layer of a file drops its handle.
 
@@ -137,7 +156,9 @@ def attach_viewer(viewer: Any) -> None:
         key = _resolved_layer_medh5_path(removed_layer)
         if key is None:
             return
-        if any(_resolved_layer_medh5_path(layer) == key for layer in layers):
+        # The event fires after the layer has left the list, so the removed
+        # layer is already excluded from this walk.
+        if _bound_anywhere(key):
             return
         REGISTRY.drop(key)
 

@@ -86,8 +86,10 @@ def sample_to_layers(sample: Any, path: str | Path) -> list[LayerDataTuple]:
             )
         )
 
+    opened: list[str] = []
     for name, annotation in sample.annotations.items():
         if annotation.kind in VOXEL_KINDS:
+            opened.append(name)
             timepoint = next(iter(annotation.timepoints), None)
             layers.append(
                 (
@@ -115,6 +117,7 @@ def sample_to_layers(sample: Any, path: str | Path) -> list[LayerDataTuple]:
                 )
             )
         elif annotation.kind in BOX_KINDS:
+            opened.append(name)
             layers.extend(
                 boxes_to_shapes(
                     annotation,
@@ -125,6 +128,19 @@ def sample_to_layers(sample: Any, path: str | Path) -> list[LayerDataTuple]:
                     suffix=_suffix(next(iter(annotation.timepoints), None), multi),
                 )
             )
+
+    # What this read actually produced, stamped on every layer of the file.
+    #
+    # The writer needs it to tell a *deleted* annotation from one that was
+    # never loaded.  Reconciling against the file's own contents instead would
+    # delete whatever the user had not opened --- a subset load, a layer closed
+    # to reduce clutter, or an annotation kind that is not a napari layer at
+    # all.  Since a layer with no record contributes nothing, anything the
+    # reader did not produce is safe by construction.
+    for _, kwargs, _ in layers:
+        metadata = kwargs.get("metadata")
+        if isinstance(metadata, dict):
+            metadata["medh5_opened"] = list(opened)
 
     return layers
 

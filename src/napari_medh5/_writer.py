@@ -42,6 +42,9 @@ class _Bundle:
     boxes: dict[str, tuple[Any, ...]] = field(default_factory=dict)
     source_path: str | None = None
     image_meta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Annotation names the reader produced layers for.  Empty means "no layer
+    # said", which is why an unrecorded annotation is never removed.
+    opened: set[str] = field(default_factory=set)
 
 
 def write_sample(path: str, layer_data: list[LayerDataTuple]) -> list[str]:
@@ -72,6 +75,9 @@ def _collect(layer_data: list[LayerDataTuple]) -> _Bundle:
         source = meta.get("medh5_path")
         if source:
             sources.add(str(source))
+        recorded = meta.get("medh5_opened")
+        if isinstance(recorded, (list, tuple, set)):
+            bundle.opened.update(str(one) for one in recorded)
 
         if role == "image" and layer_type == "image":
             name = str(meta.get("medh5_name") or kwargs.get("name") or "image")
@@ -384,7 +390,29 @@ def _amend(dest: Path, bundle: _Bundle) -> None:
                 grid = next(iter(image_grids.values()))
             _write_boxes(writer, name, data, kwargs, grid, activity, existing)
 
+        for name in _deleted(bundle, existing):
+            writer.remove_annotation(name)
+
     rebind_viewer_layers(dest)
+
+
+def _deleted(bundle: _Bundle, existing: set[str]) -> list[str]:
+    """Annotations the user opened and then removed from the viewer.
+
+    `amend` is copy-on-write, so anything not rewritten is carried through
+    untouched --- which is what protects an *unedited* annotation and,
+    until this, protected a deleted one too.
+
+    The set has to be the reader's record of what it produced, never the
+    file's own contents.  Reconciling against the file would read every
+    annotation the user did not have on screen as a deletion: a subset load, a
+    layer closed to tidy the list, or a kind napari cannot show as a layer at
+    all.  A save would then destroy annotations the user never saw. Layers
+    carrying no record contribute nothing, so the fallback is to delete
+    nothing.
+    """
+    present = set(bundle.labelmaps) | set(bundle.boxes)
+    return sorted((bundle.opened & existing) - present)
 
 
 def _write_boxes(
@@ -519,17 +547,27 @@ def _declare_grids(
 ) -> tuple[dict[str, str], set[str]]:
     """Declare one grid per distinct source grid, reusing its geometry.
 
-    Geometry is never invented: without a source grid the fallback is unit
+    Geometry is never invented.  Without a source grid the fallback is unit
     spacing at the origin, which is what an image with no stated geometry
-    actually means.
+    actually means --- but a layer that *came* from a grid and no longer
+    matches its shape is a different case, and it is refused.  See
+    :func:`_refuse_reshaped`.
     """
     out: dict[str, str] = {}
     declared: set[str] = set()
 
-    def declare(grid_id: str, shape: tuple[int, ...] | None) -> None:
+    def declare(
+        grid_id: str, shape: tuple[int, ...] | None, *, claimed: bool = True
+    ) -> None:
         if grid_id in declared:
             return
         source = source_grids.get(grid_id)
+        if not claimed:
+            # The layer did not name this grid --- `grid_id` is the fallback
+            # name, and any source grid answering to it is a coincidence.  A
+            # layer napari created has no geometry to lose, so there is nothing
+            # here to refuse over.
+            source = None
         if source is not None and (shape is None or tuple(source.shape) == shape):
             writer.add_grid(
                 grid_id,
@@ -542,6 +580,8 @@ def _declare_grids(
                 timepoint=source.timepoint,
                 frame_uid=source.frame_uid,
             )
+        elif source is not None and shape is not None:
+            _refuse_reshaped(grid_id, source, shape)
         elif shape is not None:
             writer.add_grid(grid_id, shape=shape, spacing=(1.0,) * len(shape))
         else:
@@ -549,8 +589,9 @@ def _declare_grids(
         declared.add(grid_id)
 
     for name, array in bundle.images.items():
-        grid_id = str(bundle.image_meta.get(name, {}).get("medh5_grid") or "grid")
-        declare(grid_id, tuple(array.shape))
+        referenced = bundle.image_meta.get(name, {}).get("medh5_grid")
+        grid_id = str(referenced or "grid")
+        declare(grid_id, tuple(array.shape), claimed=bool(referenced))
         out[name] = grid_id
 
     # Annotations may sit on a grid no image uses --- a segmentation at its own
@@ -563,6 +604,33 @@ def _declare_grids(
         if referenced:
             declare(str(referenced), None)
     return out, declared
+
+
+def _refuse_reshaped(grid_id: str, source: Any, shape: tuple[int, ...]) -> None:
+    """Refuse a layer whose shape no longer matches the grid it came from.
+
+    The fallback for an unknown grid is unit spacing at the origin, and for a
+    layer that never had geometry that is honest.  For a *cropped* one it is
+    not: the source spacing, direction, coordinate system and frame of
+    reference are all known, and replacing them with defaults leaves an image
+    that opens cleanly and sits in the wrong place --- misregistered against
+    the annotations drawn on it, with nothing to indicate anything was lost.
+
+    Carrying the geometry across is no better, because a crop is not only a
+    shape change: it moves the origin, and napari does not report which corner
+    was cropped to.  There is no derivable answer here, and inventing one is
+    what `medh5`'s own converters refuse to do (§3).
+    """
+    raise ValueError(
+        f"layer on grid {grid_id!r} is {tuple(shape)}, but that grid is "
+        f"{tuple(source.shape)}. A reshaped layer has no derivable geometry: "
+        "cropping moves the origin and napari does not say which corner it "
+        "kept, so the spacing, direction and frame of reference cannot be "
+        "carried across and unit spacing would silently misregister the "
+        "image. Save the layer at its original shape, or clear "
+        "`layer.metadata['medh5_grid']` to write it as a new image with no "
+        "stated geometry."
+    )
 
 
 def _grid_for(meta: dict[str, Any], written: dict[str, str], declared: set[str]) -> str:
