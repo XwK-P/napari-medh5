@@ -260,6 +260,107 @@ def make_widget_app() -> Callable[[], tuple[Any, Any]]:
 
 
 @pytest.fixture
+def rich_medh5(tmp_path: Path) -> Path:
+    """A sample carrying every annotation kind napari cannot render.
+
+    `sample_to_layers` produces layers for the voxel kinds and `boxes`; the
+    other six never appear on screen at all, which is exactly why a writer
+    building the destination from what is on screen used to lose them.
+    """
+    from medh5.annotations.geometric import Polygon
+
+    shape = (8, 16, 16)
+    mask = np.zeros(shape, dtype=bool)
+    mask[2:5, 4:10, 4:10] = True
+    path = tmp_path / "rich.medh5"
+    with medh5.create(path, sample_id="rich", subject_id="SUBJ-1") as w:
+        w.label_set(LABELS)
+        w.add_timepoint("tp0")
+        w.add_grid(
+            "g",
+            shape=shape,
+            spacing=(2.0, 1.0, 1.0),
+            origin=(-4.0, -8.0, -8.0),
+            timepoint="tp0",
+        )
+        # A grid no image uses, so the copy has to declare it or the write
+        # fails on a dangling reference.
+        w.add_grid(
+            "mesh_g",
+            shape=shape,
+            spacing=(1.0, 1.0, 1.0),
+            timepoint="tp0",
+            frame_uid="1.2.3.4",
+        )
+        w.add_image("CT", np.zeros(shape, dtype=np.int16), grid="g", modality="CT")
+        w.add_segmentation("seg", grid="g", masks={1: mask})
+        w.add_boxes(
+            "boxes",
+            boxes=[[[1.5, 4.5], [3.5, 9.5], [3.5, 9.5]]],
+            class_ids=[1],
+            grid="g",
+            scores=[0.9],
+        )
+        w.add_classification("grade", {1: 0.87, 3: 0.2}, grid="g", multilabel=True)
+        w.add_points(
+            "landmarks",
+            points=[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            grid="g",
+            class_ids=[1, 3],
+            names=["apex", "base"],
+            weights=[1.0, 0.5],
+        )
+        w.add_keypoints(
+            "pose",
+            points=[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]],
+            keypoint_classes=[1, 3],
+            class_ids=[1],
+            grid="g",
+            visibility=[[2, 1]],
+            scores=[0.77],
+        )
+        w.add_obb(
+            "oriented",
+            centers=[[4.0, 8.0, 8.0]],
+            sizes=[[2.0, 3.0, 4.0]],
+            rotations=[[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+            class_ids=[3],
+            grid="g",
+            scores=[0.6],
+        )
+        w.add_contours(
+            "outline",
+            polygons=[
+                Polygon(
+                    vertices=np.array([[2.0, 2.0], [2.0, 6.0], [6.0, 6.0]], np.float32),
+                    class_id=1,
+                    plane=(0, 3),
+                    role="outer",
+                )
+            ],
+            grid="g",
+            # Only class 1 was looked for (§11.3), so the copy has a coverage
+            # claim to preserve rather than a default to fall back on.
+            annotated_classes=[1],
+        )
+        w.add_mesh(
+            "surface",
+            vertices=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            faces=[[0, 1, 2], [0, 1, 3]],
+            grid="mesh_g",
+            normals=[[0.0, 0.0, 1.0]] * 4,
+            mesh_offsets=[0, 1, 2],
+            mesh_class_ids=[1, 3],
+        )
+    return path
+
+
+@pytest.fixture
 def real_viewer(make_napari_viewer: Callable[..., Any]) -> Any:
     """Thin wrapper around napari's ``make_napari_viewer`` for readability."""
     return make_napari_viewer()

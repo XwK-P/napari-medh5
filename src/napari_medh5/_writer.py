@@ -448,18 +448,215 @@ def _write_boxes(
     )
 
 
+# The annotation kinds napari has no layer for.  `sample_to_layers` renders
+# every voxel kind and `boxes`; these six can never appear on screen, so their
+# absence from the layer list is never something the user decided.  That is
+# what makes copying them safe where re-deriving a missing *segmentation* would
+# not be: a deleted Labels layer is a decision, a missing mesh is not.
+CARRY_KINDS = ("classification", "contours", "keypoints", "mesh", "obb", "points")
+
+
+@dataclass
+class _Carried:
+    """One source annotation to reproduce verbatim in the destination."""
+
+    name: str
+    kind: str
+    grid: str | None
+    kwargs: dict[str, Any]
+
+
+def _header_kwargs(annotation: Any) -> dict[str, Any]:
+    """The §6.2 header fields every `add_*` takes, read off the source.
+
+    `annotated_classes` is passed explicitly rather than left to default:
+    §11.3 distinguishes what an annotation *contains* from what was *looked
+    for*, and `all_given` would quietly promote every unexamined class to an
+    examined one.
+    """
+    header = annotation.header
+    return {
+        "annotated_classes": [int(c) for c in annotation.annotated_class_ids],
+        "closure": str(annotation.closure),
+        "timepoints": list(header.timepoints) if header.timepoints else None,
+        "prov": header.prov or None,
+        "quality": header.quality or None,
+        "derived_from": tuple(header.derived_from),
+    }
+
+
+def _dataset_present(annotation: Any, name: str) -> bool:
+    """Whether the annotation stores *name*, as opposed to defaulting it.
+
+    Some readers substitute a value when a dataset is absent --- `mesh`
+    reports the header's class ids when it has no `mesh_class_ids`.  Writing
+    that back would materialise a dataset the source did not have, so the copy
+    asks the group rather than the property.
+    """
+    group = getattr(annotation, "group", None)
+    return group is not None and name in group
+
+
+def _carry_kwargs(annotation: Any) -> dict[str, Any]:
+    """Everything `add_<kind>` needs to rebuild *annotation* exactly."""
+    kind = str(annotation.kind)
+    out = _header_kwargs(annotation)
+    if kind == "classification":
+        out.update(
+            # `labels` keys come back as class *names* where a label set
+            # resolves them and as digit strings where none does; the writer
+            # re-resolves names, so a digit string has to go back as an int or
+            # it is looked up as a name that was never declared.
+            labels={
+                (int(k) if str(k).lstrip("-").isdigit() else k): float(v)
+                for k, v in annotation.labels.items()
+            },
+            scope=str(annotation.scope),
+            multilabel=bool(annotation.multilabel),
+            scope_ids=(
+                [int(v) for v in annotation.scope_ids]
+                if annotation.scope_ids is not None
+                else None
+            ),
+            schemes=list(annotation.schemes) if annotation.schemes else None,
+            scheme_values=(
+                list(annotation.scheme_values) if annotation.scheme_values else None
+            ),
+        )
+        return out
+
+    # Everything below is geometric, and geometry is stated in a space and a
+    # frame of reference.  Dropping either would move the annotation.
+    out.update(
+        task=str(annotation.task),
+        space=str(annotation.space),
+        frame_uid=annotation.frame_uid or None,
+    )
+    scores = annotation.scores
+    instances = annotation.instance_ids
+    common = {
+        "instance_ids": [int(v) for v in instances] if instances is not None else None,
+        "scores": [float(v) for v in scores] if scores is not None else None,
+    }
+    if kind == "obb":
+        out.update(
+            centers=np.asarray(annotation.centers),
+            sizes=np.asarray(annotation.sizes),
+            rotations=np.asarray(annotation.rotations),
+            class_ids=[int(c) for c in annotation.object_class_ids],
+            attributes=annotation.attributes,
+            **common,
+        )
+    elif kind == "keypoints":
+        out.update(
+            points=np.asarray(annotation.points),
+            keypoint_classes=[int(c) for c in annotation.keypoint_class_ids],
+            class_ids=[int(c) for c in annotation.object_class_ids],
+            visibility=(
+                np.asarray(annotation.visibility)
+                if annotation.visibility is not None
+                else None
+            ),
+            skeleton=annotation.skeleton_id or None,
+            **common,
+        )
+    elif kind == "points":
+        out.update(
+            points=np.asarray(annotation.points),
+            class_ids=[int(c) for c in annotation.object_class_ids],
+            names=list(annotation.names) if annotation.names is not None else None,
+            weights=(
+                [float(w) for w in annotation.weights]
+                if annotation.weights is not None
+                else None
+            ),
+            correspondence=annotation.correspondence or None,
+        )
+    elif kind == "contours":
+        out.update(polygons=list(annotation.polygons()))
+    elif kind == "mesh":
+        offsets = annotation.group.get("mesh_offsets") if annotation.group else None
+        out.update(
+            vertices=np.asarray(annotation.vertices),
+            faces=np.asarray(annotation.faces),
+            normals=(
+                np.asarray(annotation.normals)
+                if annotation.normals is not None
+                else None
+            ),
+            vertex_class_ids=(
+                [int(c) for c in annotation.vertex_class_ids]
+                if annotation.vertex_class_ids is not None
+                else None
+            ),
+            mesh_offsets=[int(v) for v in offsets[...]]
+            if offsets is not None
+            else None,
+            mesh_class_ids=(
+                [int(c) for c in annotation.object_class_ids]
+                if _dataset_present(annotation, "mesh_class_ids")
+                else None
+            ),
+        )
+    else:  # pragma: no cover - guarded by the caller's CARRY_KINDS filter
+        raise ValueError(f"no copy path for annotation kind {kind!r}")
+    return out
+
+
+def _carry(sample: Any, bundle: _Bundle) -> list[_Carried]:
+    """Source annotations the write would otherwise lose.
+
+    Both write paths build the destination from what is on screen, and only
+    voxel and box annotations ever become layers.  Everything else was dropped
+    by Save As without a warning --- silently, and in the operation a user
+    reaches for to make a *copy*.
+
+    Reproduced-or-decided annotations are excluded: the ones this write
+    rebuilds from layers, and the ones the reader opened, which the user may
+    have deliberately deleted (that is #6's contract, and it is the user's
+    call). What is left is only ever a kind napari cannot show.
+    """
+    decided = set(bundle.labelmaps) | set(bundle.boxes) | bundle.opened
+    out: list[_Carried] = []
+    for name, annotation in sample.annotations.items():
+        if name in decided or str(annotation.kind) not in CARRY_KINDS:
+            continue
+        out.append(
+            _Carried(
+                name=name,
+                kind=str(annotation.kind),
+                grid=annotation.grid_id,
+                kwargs=_carry_kwargs(annotation),
+            )
+        )
+    return out
+
+
+def _write_carried(writer: Any, carried: list[_Carried], declared: set[str]) -> None:
+    """Write each carried annotation back through its own `add_*`."""
+    for one in carried:
+        add = getattr(writer, f"add_{one.kind}")
+        grid = one.grid if one.grid and one.grid in declared else None
+        add(one.name, grid=grid, **one.kwargs)
+
+
 def _write_new(dest: Path, bundle: _Bundle) -> None:
     """Write a fresh sample, carrying what the source can supply."""
     source = bundle.source_path
     document = None
     grids: dict[str, Any] = {}
     src = _Source()
+    carried: list[_Carried] = []
     if source and Path(source).exists():
         with medh5.open(source) as sample:
             document = sample.document
             grids = {k: v for k, v in sample.grids.items()}
             # Save As reproduces every annotation, so it needs every mask.
             src = _capture(sample, bundle, always=True)
+            # Read now, while the source is open: the payloads are geometry and
+            # metadata rather than voxels, so holding them is cheap and beats
+            # keeping a second handle open across `medh5.create`.
+            carried = _carry(sample, bundle)
     for name in bundle.labelmaps:
         _refuse_lossy(name, src.kinds.get(name), name in src.opaque)
 
@@ -495,7 +692,9 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
         agent = writer.software(AGENT, _version())
         activity = writer.activity("annotate", agent=agent, tool="napari")
 
-        written_grids, declared_grids = _declare_grids(writer, bundle, grids, first)
+        written_grids, declared_grids = _declare_grids(
+            writer, bundle, grids, first, carried
+        )
 
         for name, array in bundle.images.items():
             meta = bundle.image_meta.get(name, {})
@@ -541,9 +740,15 @@ def _write_new(dest: Path, bundle: _Bundle) -> None:
                 set(),
             )
 
+        _write_carried(writer, carried, declared_grids)
+
 
 def _declare_grids(
-    writer: Any, bundle: _Bundle, source_grids: dict[str, Any], first: npt.NDArray[Any]
+    writer: Any,
+    bundle: _Bundle,
+    source_grids: dict[str, Any],
+    first: npt.NDArray[Any],
+    carried: list[_Carried] | None = None,
 ) -> tuple[dict[str, str], set[str]]:
     """Declare one grid per distinct source grid, reusing its geometry.
 
@@ -555,6 +760,28 @@ def _declare_grids(
     """
     out: dict[str, str] = {}
     declared: set[str] = set()
+    # Shape -> the grid id unclaimed layers of that shape share.  Layers napari
+    # created carry no `medh5_grid`, so they all used to claim the literal id
+    # `"grid"`: the first one won and the rest were assigned to it, which fails
+    # outright on a shape mismatch and merges unrelated images where the shapes
+    # happen to agree.  Unclaimed grids are unit spacing at the origin, so two
+    # of the same shape genuinely are the same grid --- and two of different
+    # shapes never are.
+    unclaimed: dict[tuple[int, ...], str] = {}
+
+    def unclaimed_id(name: str, shape: tuple[int, ...]) -> str:
+        if shape in unclaimed:
+            return unclaimed[shape]
+        # The first one keeps the historical name, so a single-image write is
+        # byte-for-byte what it was.
+        candidate = "grid" if not unclaimed else f"grid_{_safe_id(name)}"
+        taken = set(declared) | set(source_grids) | set(unclaimed.values())
+        base, suffix = candidate, 2
+        while candidate in taken:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        unclaimed[shape] = candidate
+        return candidate
 
     def declare(
         grid_id: str, shape: tuple[int, ...] | None, *, claimed: bool = True
@@ -590,8 +817,9 @@ def _declare_grids(
 
     for name, array in bundle.images.items():
         referenced = bundle.image_meta.get(name, {}).get("medh5_grid")
-        grid_id = str(referenced or "grid")
-        declare(grid_id, tuple(array.shape), claimed=bool(referenced))
+        shape = tuple(array.shape)
+        grid_id = str(referenced) if referenced else unclaimed_id(name, shape)
+        declare(grid_id, shape, claimed=bool(referenced))
         out[name] = grid_id
 
     # Annotations may sit on a grid no image uses --- a segmentation at its own
@@ -603,7 +831,26 @@ def _declare_grids(
         referenced = meta.get("medh5_grid")
         if referenced:
             declare(str(referenced), None)
+    # An annotation carried across whole may sit on a grid nothing on screen
+    # uses --- a mesh at its own spacing, a classification scoped to a visit
+    # whose images were not loaded.  Without this its grid would be missing and
+    # the write would fail on a dangling reference.
+    for one in carried or ():
+        if one.grid:
+            declare(str(one.grid), None)
     return out, declared
+
+
+def _safe_id(name: str) -> str:
+    """*name* reduced to the §2.3 identifier alphabet, `[A-Za-z0-9_.-]{1,128}`.
+
+    A layer name reaches here from napari and is not an identifier, so it is
+    sanitised rather than trusted; uniqueness is settled by the caller.
+    """
+    cleaned = "".join(
+        c if c.isascii() and (c.isalnum() or c in "_.-") else "_" for c in name
+    )
+    return (cleaned[:120] or "image").lstrip(".")
 
 
 def _refuse_reshaped(grid_id: str, source: Any, shape: tuple[int, ...]) -> None:

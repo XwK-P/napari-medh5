@@ -410,6 +410,198 @@ class TestDeletedLayers:
             assert set(sample.annotations) == {"seg", "boxes"}
 
 
+class TestCarriedAnnotations:
+    """Save As and the annotations napari cannot put on screen.
+
+    Both write paths build the destination from the layer list, and only voxel
+    and box annotations ever become layers.  Everything else was dropped
+    without a warning --- in the operation a user reaches for to make a *copy*.
+    """
+
+    NEVER_RENDERED = {
+        "grade": "classification",
+        "landmarks": "points",
+        "pose": "keypoints",
+        "oriented": "obb",
+        "outline": "contours",
+        "surface": "mesh",
+    }
+
+    def test_every_kind_that_is_not_a_layer_survives_save_as(
+        self, rich_medh5, tmp_path
+    ):
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(dest) as sample:
+            kinds = {k: v.kind for k, v in sample.annotations.items()}
+        for name, kind in self.NEVER_RENDERED.items():
+            assert kinds.get(name) == kind, f"{name} ({kind}) was lost"
+
+    def test_a_carried_annotation_keeps_its_payload(self, rich_medh5, tmp_path):
+        """Presence is not fidelity. A copy path degrades quietly or not at all."""
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(rich_medh5) as before, medh5.open(dest) as after:
+            old_points = before.annotations["landmarks"]
+            new_points = after.annotations["landmarks"]
+            assert np.allclose(new_points.points, old_points.points)
+            assert new_points.names == old_points.names
+            assert np.allclose(new_points.weights, old_points.weights)
+
+            old_kp = before.annotations["pose"]
+            new_kp = after.annotations["pose"]
+            assert np.allclose(new_kp.visibility, old_kp.visibility)
+            assert np.allclose(new_kp.scores, old_kp.scores)
+
+            old_mesh = before.annotations["surface"]
+            new_mesh = after.annotations["surface"]
+            assert np.allclose(new_mesh.vertices, old_mesh.vertices)
+            assert np.allclose(new_mesh.faces, old_mesh.faces)
+            assert np.allclose(new_mesh.normals, old_mesh.normals)
+            # Submeshes are an offsets dataset, not a count to recompute.
+            assert new_mesh.n_submeshes == old_mesh.n_submeshes == 2
+
+            old_poly = next(before.annotations["outline"].polygons())
+            new_poly = next(after.annotations["outline"].polygons())
+            assert np.allclose(new_poly.vertices, old_poly.vertices)
+            assert (new_poly.plane, new_poly.role) == (old_poly.plane, old_poly.role)
+
+            assert dict(after.annotations["grade"].labels) == dict(
+                before.annotations["grade"].labels
+            )
+
+    def test_S11_3_a_carried_annotation_keeps_its_coverage(self, rich_medh5, tmp_path):
+        """`annotated_class_ids` is what was *looked for*, not what is present.
+
+        Letting `add_*` default it to `all_given` would promote every
+        unexamined class to an examined one, turning "nobody checked" into a
+        usable negative -- the §11.3 distinction this format exists to keep.
+        """
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(rich_medh5) as before, medh5.open(dest) as after:
+            for name in self.NEVER_RENDERED:
+                assert (
+                    after.annotations[name].annotated_class_ids
+                    == before.annotations[name].annotated_class_ids
+                ), name
+            assert after.annotations["outline"].annotated_class_ids == (1,)
+
+    def test_a_carried_annotation_is_not_attributed_to_napari(
+        self, rich_medh5, tmp_path
+    ):
+        """napari did not touch these -- it cannot even display them.
+
+        Stamping its own activity on them would put a viewer's name on work it
+        never saw, which is the opposite of what the provenance graph is for.
+        """
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(dest) as sample:
+            for name in self.NEVER_RENDERED:
+                assert sample.annotations[name].header.prov is None, name
+
+    def test_a_grid_only_a_carried_annotation_uses_is_declared(
+        self, rich_medh5, tmp_path
+    ):
+        """The mesh sits on a grid no image references."""
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        with medh5.open(rich_medh5) as before, medh5.open(dest) as after:
+            assert after.annotations["surface"].grid_id == "mesh_g"
+            assert after.grids["mesh_g"].frame_uid == before.grids["mesh_g"].frame_uid
+            assert after.grids["mesh_g"].spacing == before.grids["mesh_g"].spacing
+
+    def test_a_carried_copy_still_validates(self, rich_medh5, tmp_path):
+        from medh5.validate import validate_file
+
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), materialise(read_layers(rich_medh5)))
+        REGISTRY.close_all()
+        assert not validate_file(dest).errors
+
+    def test_a_deleted_layer_is_still_deleted(self, rich_medh5, tmp_path):
+        """The copy must not resurrect what the user removed.
+
+        A voxel or box annotation absent from the layer list is a decision the
+        user made (#6). Only the kinds napari cannot show are copied, because
+        their absence is never a decision -- if the carry set were "everything
+        missing from the bundle" instead, deleting a segmentation would put it
+        straight back.
+        """
+        layers = [
+            one
+            for one in materialise(read_layers(rich_medh5))
+            if one[1]["metadata"].get("medh5_role") != "seg"
+        ]
+        dest = tmp_path / "copy.medh5"
+        write_sample(str(dest), layers)
+        REGISTRY.close_all()
+        with medh5.open(dest) as sample:
+            assert "seg" not in sample.annotations
+            assert "surface" in sample.annotations  # never a layer, never a decision
+
+
+class TestFallbackGridNames:
+    """Layers napari created carry no `medh5_grid`, so they all claimed `"grid"`."""
+
+    def _layer(self, name, shape):
+        return (
+            np.zeros(shape, np.float32),
+            {"name": name, "metadata": {"medh5_role": "image", "medh5_name": name}},
+            "image",
+        )
+
+    def test_new_layers_of_different_shapes_get_their_own_grids(self, tmp_path):
+        """The first one won and the rest were assigned to it, which fails."""
+        dest = tmp_path / "two.medh5"
+        write_sample(
+            str(dest), [self._layer("A", (4, 8, 8)), self._layer("B", (2, 4, 4))]
+        )
+        with medh5.open(dest) as sample:
+            assert sample.images["A"].grid_id != sample.images["B"].grid_id
+            assert sample.grids[sample.images["A"].grid_id].shape == (4, 8, 8)
+            assert sample.grids[sample.images["B"].grid_id].shape == (2, 4, 4)
+
+    def test_new_layers_of_one_shape_still_share_a_grid(self, tmp_path):
+        """Unclaimed grids are unit spacing at the origin, so these are the
+        same grid -- merging them is deduplication, not a claim."""
+        dest = tmp_path / "same.medh5"
+        write_sample(
+            str(dest), [self._layer("A", (4, 8, 8)), self._layer("B", (4, 8, 8))]
+        )
+        with medh5.open(dest) as sample:
+            assert sample.images["A"].grid_id == sample.images["B"].grid_id
+            assert sorted(sample.grids) == ["grid"]
+
+    def test_a_new_layer_does_not_adopt_a_source_grid_by_name(self, tmp_path):
+        """A source grid answering to `"grid"` is a coincidence, not a match."""
+        source = tmp_path / "named.medh5"
+        with medh5.create(source, sample_id="s", subject_id="j") as w:
+            w.add_timepoint("tp0")
+            w.add_grid("grid", shape=(8, 16, 16), spacing=(2.0, 1.0, 1.0))
+            w.add_image(
+                "CT", np.zeros((8, 16, 16), np.int16), grid="grid", modality="CT"
+            )
+
+        dest = tmp_path / "out.medh5"
+        layers = [
+            one
+            for one in materialise(read_layers(source))
+            if one[1]["metadata"].get("medh5_role") == "image"
+        ]
+        write_sample(str(dest), [*layers, self._layer("NEW", (4, 4, 4))])
+        REGISTRY.close_all()
+        with medh5.open(dest) as sample:
+            assert sample.grids[sample.images["CT"].grid_id].spacing == (2.0, 1.0, 1.0)
+            assert sample.grids[sample.images["NEW"].grid_id].shape == (4, 4, 4)
+
+
 class TestSaveAs:
     def test_it_writes_a_new_file(self, tiny_medh5, tmp_path):
         dest = tmp_path / "copy.medh5"
