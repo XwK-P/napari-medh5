@@ -144,6 +144,31 @@ class TestRegistry:
         viewer.layers.events.removed.emit(layer)
         assert REGISTRY.get(tiny_medh5) is None
 
+    def test_a_second_viewer_of_the_same_file_holds_it_open(self, tiny_medh5):
+        """The registry is process-global; the predicate was per-viewer.
+
+        Two windows on one `.medh5` share one handle.  Closing the last layer
+        in one dropped it while the other's lazy arrays were still bound to it,
+        so those failed on the next slice --- in a window the user never
+        touched.
+        """
+        first, second = _Viewer(), _Viewer()
+        attach_viewer(first)
+        attach_viewer(second)
+        REGISTRY.acquire(tiny_medh5)
+        here = _Layer({"medh5_path": str(tiny_medh5), "medh5_role": "image"})
+        there = _Layer({"medh5_path": str(tiny_medh5), "medh5_role": "image"})
+        first.layers.append(here)
+        second.layers.append(there)
+
+        first.layers.remove(here)
+        first.layers.events.removed.emit(here)
+        assert REGISTRY.get(tiny_medh5) is not None
+
+        second.layers.remove(there)
+        second.layers.events.removed.emit(there)
+        assert REGISTRY.get(tiny_medh5) is None
+
     def test_attach_is_idempotent(self, tiny_medh5):
         viewer = _Viewer()
         attach_viewer(viewer)
